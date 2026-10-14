@@ -1,0 +1,13 @@
+{
+  "source": "BeIR/msmarco",
+  "config": "corpus",
+  "split": "corpus",
+  "target_chunks": 10000,
+  "actual_documents": 5457,
+  "actual_chunks": 10001,
+  "chunk_size": 300,
+  "overlap": 50,
+  "sha256_tsv": "cdca54aa145a8343916447f9b9fcd8ddcfdb72a3129c5263f5fba3c485434e8b",
+  "complete": true,
+  "timestamp": "2026-10-14T07:24:04Z"
+}
