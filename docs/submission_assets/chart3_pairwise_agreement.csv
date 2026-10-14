@@ -1,0 +1,3 @@
+corpus_scale_chunks,comparison_pair,agreement_at_3,agreement_at_5,agreement_at_10,aggregation_method,notes
+5000,FP32 HNSW vs FP16 HNSW,0.9667,0.9800,0.9850,Mean top-K set intersection overlap fraction (|Top-K_FP32 ∩ Top-K_FP16| / K) over 20 queries,Recorded in benchmark_scale_5k_v2.json under forced_hnsw.relative_agreement at ef_search=40 across 20 fixed evaluation queries.
+10000,FP32 HNSW vs FP16 HNSW,0.9667,0.9600,0.9500,Mean top-K set intersection overlap fraction (|Top-K_FP32 ∩ Top-K_FP16| / K) over 20 queries,Recorded in benchmark_scale_10k_v2.json under forced_hnsw.relative_agreement at ef_search=40 across 20 fixed evaluation queries.

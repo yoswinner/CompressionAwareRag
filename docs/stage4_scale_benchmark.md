@@ -3,7 +3,7 @@
 **Project:** Compression-Aware Vector Database Indexing for Memory-Efficient and Low-Latency Retrieval-Augmented Generation (RAG)<br>
 **Stage:** 4 — Corpus Scaling & Multi-Configuration Benchmark<br>
 **Academic Target:** BCSE302P — Database Systems Lab, VIT Vellore<br>
-**Authors:** Yash Pradhan (24BCE0702), Anjini Pandey (24BCE0714)<br>
+**Authors:** Yash Pradhan, Anjini Pandey<br>
 **Date:** 2026-10-14<br>
 **Baseline Checkpoint:** `da2a017` (`Add HNSW indexing benchmark`)<br>
 **Status:** Completed, Independently Validated, and Verified

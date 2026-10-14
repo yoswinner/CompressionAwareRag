@@ -1,0 +1,9 @@
+corpus_scale_chunks,retrieval_mode,representation,mean_latency_ms,median_latency_ms,iqr_ms,min_latency_ms,max_latency_ms,stdev_ms,speedup_vs_fp32_mean,speedup_vs_fp32_median,latency_reduction_pct_mean,latency_reduction_pct_median,notes
+5000,Exact Search,FP32 (vector),42.285,44.694,16.018,10.907,57.104,10.083,1.00x,1.00x,0.00%,0.00%,Stage 4 v2 benchmark harness (100 trials: 20q x 5r). Timed strictly around client execute and fetchall with GUC outside timer and ORDER BY distance alias.
+5000,Exact Search,FP16 (halfvec),6.802,6.277,2.606,3.203,15.669,2.318,6.22x,7.12x,83.91%,85.96%,Stage 4 v2 benchmark harness (100 trials: 20q x 5r). Halfvec faster on 100/100 trials.
+5000,Forced HNSW,FP32 (vector),4.129,3.371,1.641,2.449,42.670,4.073,1.00x,1.00x,0.00%,0.00%,Stage 4 v2 benchmark harness (100 trials: 20q x 5r; ef_search=40). Index Scan using chunks_5k_fp32_hnsw_idx.
+5000,Forced HNSW,FP16 (halfvec),3.372,2.923,1.571,2.386,6.501,0.952,1.22x,1.15x,18.32%,13.28%,Stage 4 v2 benchmark harness (100 trials: 20q x 5r; ef_search=40). Index Scan using chunks_5k_halfvec_hnsw_idx.
+10000,Exact Search,FP32 (vector),89.004,92.664,32.376,50.664,125.432,20.031,1.00x,1.00x,0.00%,0.00%,Stage 4 v2 benchmark harness (100 trials: 20q x 5r). Timed strictly around client execute and fetchall with GUC outside timer and ORDER BY distance alias.
+10000,Exact Search,FP16 (halfvec),12.301,11.541,2.866,7.205,22.226,3.163,7.24x,8.03x,86.18%,87.55%,Stage 4 v2 benchmark harness (100 trials: 20q x 5r). Halfvec faster on 100/100 trials.
+10000,Forced HNSW,FP32 (vector),3.674,3.415,1.548,2.420,6.420,0.990,1.00x,1.00x,0.00%,0.00%,Stage 4 v2 benchmark harness (100 trials: 20q x 5r; ef_search=40). Index Scan using chunks_10k_fp32_hnsw_idx.
+10000,Forced HNSW,FP16 (halfvec),3.856,3.820,1.796,2.482,7.740,1.092,0.95x,0.89x,-4.95%,-11.86%,Stage 4 v2 benchmark harness (100 trials: 20q x 5r; ef_search=40). Index Scan using chunks_10k_halfvec_hnsw_idx. Medians within ~0.4 ms.

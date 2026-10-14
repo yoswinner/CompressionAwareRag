@@ -1,0 +1,9 @@
+corpus_scale_chunks,retrieval_mode,representation,q0_shared_buffer_hits,q0_server_execution_time_ms,q0_limit_actual_time_ms,plan_type_verified,notes
+5000,Exact Search,FP32 (vector),15032,24.540,24.527,Seq Scan,Diagnostic Query 0 plan from benchmark_scale_5k_v2.json. 15032 shared buffer hits to assemble out-of-line TOAST chunks.
+5000,Exact Search,FP16 (halfvec),1000,2.995,2.980,Seq Scan,Diagnostic Query 0 plan from benchmark_scale_5k_v2.json. 1000 shared buffer hits to scan inlined heap pages (93.35% fewer buffer hits vs FP32).
+5000,Forced HNSW,FP32 (vector),830,0.571,0.560,Index Scan,Diagnostic Query 0 plan from benchmark_scale_5k_v2.json using chunks_5k_fp32_hnsw_idx.
+5000,Forced HNSW,FP16 (halfvec),753,0.405,0.397,Index Scan,Diagnostic Query 0 plan from benchmark_scale_5k_v2.json using chunks_5k_halfvec_hnsw_idx.
+10000,Exact Search,FP32 (vector),30064,54.487,54.471,Seq Scan,Diagnostic Query 0 plan from benchmark_scale_10k_v2.json. 30064 shared buffer hits to assemble out-of-line TOAST chunks.
+10000,Exact Search,FP16 (halfvec),2000,7.810,7.792,Seq Scan,Diagnostic Query 0 plan from benchmark_scale_10k_v2.json. 2000 shared buffer hits to scan inlined heap pages (93.35% fewer buffer hits vs FP32).
+10000,Forced HNSW,FP32 (vector),930,0.624,0.615,Index Scan,Diagnostic Query 0 plan from benchmark_scale_10k_v2.json using chunks_10k_fp32_hnsw_idx.
+10000,Forced HNSW,FP16 (halfvec),847,0.503,0.495,Index Scan,Diagnostic Query 0 plan from benchmark_scale_10k_v2.json using chunks_10k_halfvec_hnsw_idx.

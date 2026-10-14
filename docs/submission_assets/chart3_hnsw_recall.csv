@@ -1,0 +1,5 @@
+corpus_scale_chunks,representation,recall_at_3,recall_at_5,recall_at_10,reference_ground_truth,notes
+5000,FP32 HNSW (vector),0.9167,0.9100,0.9550,5k FP32 Exact Sequential Scan (uncompressed reference),Recorded in benchmark_scale_5k_v2.json under forced_hnsw.fp32_recall_vs_exact. Evaluated at ef_search=40 across 20 fixed evaluation queries.
+5000,FP16 HNSW (halfvec),0.9167,0.9100,0.9600,5k FP32 Exact Sequential Scan (uncompressed reference),Recorded in benchmark_scale_5k_v2.json under forced_hnsw.halfvec_recall_vs_exact. Evaluated at ef_search=40 across 20 fixed evaluation queries.
+10000,FP32 HNSW (vector),0.9667,0.9500,0.9450,10k FP32 Exact Sequential Scan (uncompressed reference),Recorded in benchmark_scale_10k_v2.json under forced_hnsw.fp32_recall_vs_exact. Evaluated at ef_search=40 across 20 fixed evaluation queries.
+10000,FP16 HNSW (halfvec),0.9500,0.9400,0.9600,10k FP32 Exact Sequential Scan (uncompressed reference),Recorded in benchmark_scale_10k_v2.json under forced_hnsw.halfvec_recall_vs_exact. Evaluated at ef_search=40 across 20 fixed evaluation queries.
