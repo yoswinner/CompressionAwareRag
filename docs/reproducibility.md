@@ -10,7 +10,7 @@
 ## 1. Prerequisites & Environment Setup
 
 ### 1.1 Core Software Requirements
-- **PostgreSQL:** Version 18.x (tested on PostgreSQL 18.4, 64-bit).
+- **PostgreSQL:** Version 18.x (tested on PostgreSQL 18.4 on `x86_64`, 64-bit).
 - **pgvector:** Version 0.8.0+ (tested on `pgvector` v0.8.4 with `halfvec` support).
 - **Python:** Python 3.11+ (tested on Python 3.13.14).
 - **Ollama:** Version 0.5+ serving `nomic-embed-text:latest` (768 dimensions).
@@ -86,13 +86,13 @@ Expected output:
 
 ## 3. Unit & Integration Test Suite
 
-Run the complete 107-test test suite:
+Run the complete 115-test test suite:
 ```bash
 pytest -v
 ```
 Expected output:
 ```
-============================ 107 passed in ~13s =============================
+============================ 115 passed in ~26s =============================
 ```
 
 ---
@@ -106,56 +106,60 @@ python src/planner_sensitivity_experiment.py --pilot
 ```
 
 ### 4.2 Full Research Benchmark Execution
-Execute the full 9,900-query benchmark across all 9 profiles:
+Execute the full 9,900-query benchmark across all 9 profiles using supported CLI flags:
 ```bash
-python src/planner_sensitivity_experiment.py --scale all --representation all --canonical-profile P4 --passes 5 --warmup 2
+python src/planner_sensitivity_experiment.py --scale all --representation all --canonical-profile P4 --warmup-passes 2 --measured-passes 5 --random-seed 42 --output-dir results/planner_sensitivity/full_run_<id>
 ```
 This produces:
-- `results/planner_sensitivity/full_run_<timestamp>/latency_results.csv` (9,900 timed queries)
-- `results/planner_sensitivity/full_run_<timestamp>/plan_capture.jsonl` (4,860 plan captures)
-- `results/planner_sensitivity/full_run_<timestamp>/diagnostic_results.jsonl` (540 diagnostic runs)
-- `results/planner_sensitivity/full_run_<timestamp>/summary_results.csv`
-- `results/planner_sensitivity/full_run_<timestamp>/experiment_manifest.json`
-- `results/planner_sensitivity/full_run_<timestamp>/environment_snapshot.json`
+- `results/planner_sensitivity/full_run_<id>/latency_results.csv` (9,900 timed queries)
+- `results/planner_sensitivity/full_run_<id>/plan_capture.jsonl` (4,860 plan captures)
+- `results/planner_sensitivity/full_run_<id>/diagnostic_results.jsonl` (540 diagnostic runs)
+- `results/planner_sensitivity/full_run_<id>/summary_results.csv`
+- `results/planner_sensitivity/full_run_<id>/experiment_manifest.json`
+- `results/planner_sensitivity/full_run_<id>/environment_snapshot.json`
 
 ---
 
 ## 5. Research Analysis Scripts
 
-All analysis scripts reside in `scripts/analysis/` and require zero database access (they consume the benchmark evidence directly):
+The research analysis scripts are classified by their operational dependency:
 
-### 5.1 Comprehensive Statistical Synthesis
+### 5.1 Comprehensive Statistical Synthesis (Offline Analysis)
 ```bash
 python scripts/analysis/analyze_phase3_sensitivity.py
 ```
-Outputs:
-- Physical storage metrics and reductions table.
-- Planner access-path selection distribution table.
-- Canonical Profile P4 latency percentiles (P50, P95, Mean, Std).
-- Boundary-tie tolerance sensitivity table ($\tau \in \{1\text{e-}7, 1\text{e-}6, 1\text{e-}5\}$).
-- Corrected root-plan buffer consumption table.
-- Friedman tests across profiles and paired Wilcoxon signed-rank tests with Holm-Bonferroni correction.
+- **Requirements:** Completely offline; requires zero database access. Consumes existing Phase 2 benchmark CSV/JSONL files directly.
+- **Outputs:**
+  - Physical storage metrics and reductions table.
+  - Planner access-path selection distribution table.
+  - Canonical Profile P4 latency percentiles (P50, P95, Mean, Sample SD).
+  - Boundary-tie tolerance sensitivity table ($\tau \in \{1\text{e-}7, 1\text{e-}6, 1\text{e-}5\}$).
+  - Corrected root-plan buffer consumption table.
+  - Non-parametric inference: Benjamini-Hochberg adjusted Friedman tests across 9 profiles, Holm-Bonferroni adjusted Wilcoxon signed-rank tests with matched rank-biserial correlation $r_{\text{rb}}$, and 30,000-iteration query-cluster bootstrap for exact vs. forced-HNSW latency.
 
-### 5.2 Boundary-Tie Sensitivity Audit
+### 5.2 Boundary-Tie Sensitivity Audit (Read-Only DB Access)
 ```bash
 python scripts/analysis/run_phase3a_tie_sensitivity.py
 ```
-Re-evaluates boundary-tie prevalence and calculates tie-aware Recall@10 across all 1,980 conditions.
+- **Requirements:** Read-only database access to experimental tables (`prepare_threshold=None`, `prepare=False`). Evaluates boundary-tie prevalence and calculates tie-aware Recall@10 across all 1,980 conditions against exact sequential scans.
 
-### 5.3 Evidence Chain Closure & Equivalence Audit
+### 5.3 Evidence Chain Closure & Equivalence Audit (Read-Only DB Access)
 ```bash
 python scripts/analysis/run_phase3a_addendum_closure.py
 ```
-Exports explicit FP32 reference top-10 IDs, independently recalculates Recall@10, and audits forced-HNSW `enable_bitmapscan` equivalence.
+- **Requirements:** Read-only database access to experimental tables (`prepare_threshold=None`, `prepare=False`). Exports explicit FP32 reference top-10 IDs, independently recalculates Recall@10, and audits forced-HNSW `enable_bitmapscan` equivalence.
 
 ---
 
 ## 6. Evidence Handling & Cryptographic Verification
 
-The primary benchmark artifacts and audits are packaged in immutable ZIP archives in the repository root:
-- `Phase2_Full_Benchmark_Evidence_20261031.zip` (SHA-256: `b56bfd0fd702b5faecec379e290d9412f206bf0c867fefa8e8a09a62088722b0`)
-- `Phase3A_Tie_Sensitivity_Evidence_20261031.zip` (SHA-256: `de19a122ea2d918cd5820d6c450cec873c33ecdab8a1f297cdcd9082de222d52`)
-- `Phase3A_Evidence_Closure_Addendum_20261031.zip` (SHA-256: `3a33532c35045cb9a15eb7738e2bd8851c37304380b01cdf2b4cc7d6b671f7eb`)
+The primary benchmark artifacts and audits are packaged in immutable ZIP archives in the repository root. These archives are excluded from Git tracking via `.gitignore` due to size constraints. If replicating offline analysis from a fresh clone, the researcher must supply the archives or extract them to their expected paths:
+
+| Evidence Archive | Size (Bytes) | SHA-256 Checksum | Target Extraction Path |
+| :--- | :---: | :--- | :--- |
+| `Phase2_Full_Benchmark_Evidence_20261031.zip` | 18,526,371 | `b56bfd0fd702b5faecec379e290d9412f206bf0c867fefa8e8a09a62088722b0` | `results/planner_sensitivity/full_run_20261031_01/` |
+| `Phase3A_Tie_Sensitivity_Evidence_20261031.zip` | 130,465 | `de19a122ea2d918cd5820d6c450cec873c33ecdab8a1f297cdcd9082de222d52` | `results/planner_sensitivity/phase3_tie_sensitivity_20261031/` |
+| `Phase3A_Evidence_Closure_Addendum_20261031.zip` | 37,500 | `3a33532c35045cb9a15eb7738e2bd8851c37304380b01cdf2b4cc7d6b671f7eb` | `results/planner_sensitivity/phase3a_closure_addendum_20261031/` |
 
 To verify archive integrity:
 ```python

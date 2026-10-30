@@ -13,11 +13,11 @@
 
 Modern relational database management systems (RDBMS) integrating approximate nearest-neighbor (ANN) vector search rely on cost-based query planners originally designed for scalar B-trees and heap sequential scans. While scalar indexes exhibit low index startup overhead and monotonic selectivity, vector graph indexes—such as Hierarchical Navigable Small World (HNSW) graphs—exhibit distinct storage topologies, iterative graph traversals, and non-linear distance evaluation costs.
 
-In `pgvector` v0.8.4 running on PostgreSQL, physical tuple layout and column storage strategies (`EXTENDED` vs. `PLAIN`) drastically alter heap page counts. Due to heuristic TOAST-adjustment logic in `hnswcostestimate` (`src/hnsw.c:L1228-L1236`), tables with out-of-line TOASTed vectors (e.g., `vector(768)` under default `STORAGE EXTENDED`) receive an artificial startup-cost discount because the main heap page count ($relpages$) drops below the graph's entry-point traversal pages ($startupPages$). In contrast, quantized or inlined vector tables (e.g., `halfvec(768)` or `vector(768)` under `STORAGE PLAIN`) retain larger main heap page counts, preventing this heuristic discount from firing. Consequently, the query planner may erroneously select a brute-force sequential scan with Top-$N$ sort over an HNSW index, or vice-versa, depending on planner cost parameters ($random\_page\_cost$, $cpu\_operator\_cost$).
+In `pgvector` v0.8.4 running on PostgreSQL, physical tuple layout and column storage strategies (`EXTENDED` vs. `PLAIN`) drastically alter heap page counts. Due to heuristic TOAST-adjustment logic in `hnswcostestimate` (`src/hnsw.c:L1228-L1236`), tables with out-of-line TOASTed vectors (e.g., `vector(768)` under default `STORAGE EXTENDED`) receive an artificial startup-cost discount because the main heap page count ($relpages$) drops below the graph's entry-point traversal pages ($startupPages$). In contrast, quantized or inlined vector tables (e.g., `halfvec(768)` or `vector(768)` under `STORAGE PLAIN`) retain larger main heap page counts, preventing this heuristic discount from firing. Consequently, the query planner may elect a brute-force sequential scan with Top-$N$ sort over an HNSW index, or vice-versa, depending on planner cost parameters ($random\_page\_cost$, $cpu\_operator\_cost$).
 
 This protocol defines a rigorous, reproducible framework to investigate:
 
-- **RQ1 (Planner Indifference Frontier):** Under what combinations of $random\_page\_cost \in \{1.0, 4.0, 8.0\}$ and $cpu\_operator\_cost \in \{0.0025, 0.010, 0.050\}$ does PostgreSQL 18 elect a sequential table scan over an available HNSW index scan for vector $K$-NN retrieval ($K=10$)?
+- **RQ1 (Planner Indifference Frontier):** Under what combinations of $random\_page\_cost \in \{1.0, 4.0, 8.0\}$ and $cpu\_operator\_cost \in \{0.0025, 0.010, 0.050\}$ does PostgreSQL elect a sequential table scan over an available HNSW index scan for vector $K$-NN retrieval ($K=10$)?
 - **RQ2 (Representation & Storage Footprint Impact):** How does physical vector layout (`FP32-EXTENDED` vs. `FP32-PLAIN` vs. `FP16-EXTENDED`) shift this indifference frontier across scaling corpus sizes ($N \in \{1{,}001, 5{,}000, 10{,}000\}$ chunks)?
 - **RQ3 (Performance & Accuracy Consequences):** What are the empirical latency penalties ($P_{50}, P_{95}$) and Recall@10 trade-offs when the query planner makes a suboptimal retrieval decision compared to forced HNSW execution?
 
@@ -52,12 +52,12 @@ planner_sensitivity
 #### Coordinate Payload Bytes versus Complete Datum Bytes:
 - **FP32 (`vector(768)`):**
   - Raw coordinate payload: $768 \times 4 \text{ bytes} = 3{,}072 \text{ bytes}$.
-  - Datum structure with pgvector header: $3{,}072 + 8 \text{ bytes} = 3{,}080 \text{ bytes}$ (under documented $4d + 8$ formula).
-  - Empirically measured storage footprint (`pg_column_size`): $3{,}076 \text{ bytes}$ (reflecting a 4-byte varlena header).
+  - Logical datum structure: $3{,}072 + 8 \text{ bytes} = 3{,}080 \text{ bytes}$ (under documented uncompressed $4d + 8$ formula).
+  - Empirically measured storage footprint (`pg_column_size`): $3{,}076 \text{ bytes}$ for `FP32 Extended` (utilizing a 4-byte compressed/toastable varlena header format), and $3{,}080 \text{ bytes}$ for `FP32 Plain` (utilizing the full 8-byte header $4d + 8$).
   - Out-of-line TOAST threshold: Exceeds the ~2 KiB `TOAST_TUPLE_THRESHOLD` on standard 8 KiB PostgreSQL pages.
 - **FP16 (`halfvec(768)`):**
   - Raw coordinate payload: $768 \times 2 \text{ bytes} = 1{,}536 \text{ bytes}$.
-  - Datum structure with pgvector header: $1{,}536 + 8 \text{ bytes} = 1{,}544 \text{ bytes}$ (under documented $2d + 8$ formula).
+  - Logical datum structure: $1{,}536 + 8 \text{ bytes} = 1{,}544 \text{ bytes}$ (under documented $2d + 8$ formula).
   - Empirically measured storage footprint (`pg_column_size`): $1{,}544 \text{ bytes}$.
   - Inline heap storage: Sits comfortably below the 2 KiB threshold, remaining 100% inline within main heap blocks.
 
@@ -71,12 +71,12 @@ planner_sensitivity
 2. **`FP32-PLAIN` vs. `FP16-EXTENDED` (Inline Density & Quantization Contrast):**
    - **Mechanism:** Both representations store embeddings inline in heap blocks (`halfvec(768)` is 1,544 bytes, naturally below the TOAST threshold).
    - **Combined Variables:** Comparing `FP32-PLAIN` and `FP16-EXTENDED` reflects:
-     * Datum size (3,076 bytes vs 1,544 bytes per vector).
+     * Datum size (3,080 bytes vs 1,544 bytes per vector).
      * Heap tuple density (2 tuples/page vs 4 tuples/page).
      * HNSW index graph size (~40 MB vs ~20 MB at 10k scale).
      * Distance operation implementation (`vector_cosine_ops` vs `halfvec_cosine_ops`).
      * Quantization noise resulting from IEEE 754 16-bit half-precision conversion.
-   - **Attribution Discipline:** Execution speedup observed in `halfvec` operations stems primarily from reduced memory bus bandwidth, higher buffer cache page density, and reduced index graph size. While modern CPU architectures feature SIMD instruction sets, no claim is made that FP16 speedup is caused by SIMD unless independently isolated via hardware instruction counters.
+   - **Attribution Discipline:** Execution speedup observed in `halfvec` operations stems primarily from reduced disk/memory data footprint and higher buffer cache page density. Unmeasured hardware claims regarding memory bus saturation or SIMD execution are explicitly disclaimed unless independently isolated via hardware performance counters.
 
 ### 2.3 Atomic Fail-Closed Provisioning Workflow
 Each scale is provisioned within an isolated transaction (`autocommit=False`) with the following strict execution sequence:
@@ -106,7 +106,7 @@ We vary $random\_page\_cost \in \{1.0, 4.0, 8.0\}$ and $cpu\_operator\_cost \in 
 | **P1** | 1.0 | 0.0025 | 1.0 | 0.01 | Low random I/O cost setting, pgvector default operator cost (Pilot Forced Profile) |
 | **P2** | 1.0 | 0.0100 | 1.0 | 0.01 | Low random I/O cost setting, elevated CPU operator cost |
 | **P3** | 1.0 | 0.0500 | 1.0 | 0.01 | Low random I/O cost setting, high CPU operator cost |
-| **P4** | 4.0 | 0.0025 | 1.0 | 0.01 | **Canonical Forced Baseline** (PostgreSQL 18 default settings: $rpc=4.0, op=0.0025$) |
+| **P4** | 4.0 | 0.0025 | 1.0 | 0.01 | **Canonical Forced Baseline** (PostgreSQL default settings: $rpc=4.0, op=0.0025$) |
 | **P5** | 4.0 | 0.0100 | 1.0 | 0.01 | Standard random I/O cost setting, elevated CPU operator cost sensitivity setting |
 | **P6** | 4.0 | 0.0500 | 1.0 | 0.01 | Standard random I/O cost setting, high CPU operator cost sensitivity setting |
 | **P7** | 8.0 | 0.0025 | 1.0 | 0.01 | High random I/O cost setting, pgvector default operator cost |
@@ -224,7 +224,7 @@ flowchart LR
 # Verify PostgreSQL and pgvector availability
 psql -U postgres -d compression_aware_rag_scale -c "SELECT extversion FROM pg_extension WHERE extname = 'vector';"
 
-# Run full test suite (107 tests)
+# Run full test suite (115 tests)
 pytest -v
 ```
 
@@ -246,17 +246,17 @@ python src/planner_sensitivity_experiment.py --pilot
 ### Step 4: Full Multi-Profile Research Execution (9,900 Timed Queries, 540 Diagnostics)
 ```bash
 # Full execution across all scales and profiles under canonical profile P4
-python src/planner_sensitivity_experiment.py --scale all --representation all --canonical-profile P4 --passes 5 --warmup 2
+python src/planner_sensitivity_experiment.py --scale all --representation all --canonical-profile P4 --warmup-passes 2 --measured-passes 5 --random-seed 42 --output-dir results/planner_sensitivity/full_run_<id>
 ```
 
 ### Step 5: Research Analysis & Provenance Verification
 ```bash
-# Execute comprehensive statistical analysis & non-parametric tests
+# Execute comprehensive statistical analysis & non-parametric tests (offline)
 python scripts/analysis/analyze_phase3_sensitivity.py
 
-# Execute boundary-tie tolerance sensitivity audit
+# Execute boundary-tie tolerance sensitivity audit (read-only DB)
 python scripts/analysis/run_phase3a_tie_sensitivity.py
 
-# Execute evidence chain closure & GUC equivalence audit
+# Execute evidence chain closure & GUC equivalence audit (read-only DB)
 python scripts/analysis/run_phase3a_addendum_closure.py
 ```
