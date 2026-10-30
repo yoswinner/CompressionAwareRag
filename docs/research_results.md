@@ -6,7 +6,7 @@
 **Target Venue:** IEEE Transactions on Knowledge and Data Engineering (TKDE) / IEEE International Conference on Data Engineering (ICDE)  
 **Repository Branch:** `research/planner-sensitivity`  
 **Base Benchmark Commit:** `3f2beee66cecd67aa8fc4cec69c364b92c07b884`  
-**Final Audit Commit:** `8dfdce0a00338d0c6e0c4f70ea3e83d40e9b93ee`  
+**Audit Baseline:** Phase 3 Verification Complete
 
 ---
 
@@ -19,23 +19,27 @@ This research investigates how vector precision quantization and relational phys
 - **RQ3 (Latency, Buffer Footprint, and Recall Accuracy):** What are the empirical execution time penalties ($P_{50}, P_{95}$), shared buffer page hits, and Recall@10 consequences of planner-selected paths compared to forced HNSW index scans?
 
 ### Hypotheses
-1. **$H_1$ (Storage-Induced Plan Divergence):** Out-of-line TOASTing of `vector(768)` under `STORAGE EXTENDED` artificially lowers main heap pages ($relpages$), altering the optimizer's startup cost calculations in `hnswcostestimate`, while inline storage (`STORAGE PLAIN` or `halfvec(768)`) inflates heap page counts.
-2. **$H_2$ (Scale-Dependent Plan Convergence):** At small corpus scales ($N=1{,}001$), planner cost profiles heavily influence path choice (HNSW vs. Seq Scan). At larger corpus scales ($N \ge 5{,}000$), the empirical cost disparity between sequential distance evaluations and HNSW graph traversals dominates, causing the planner to select HNSW index scans 100% of the time across all evaluated cost configurations.
-3. **$H_3$ (Storage and Retrieval Parity of FP16):** Half-precision 16-bit quantization (`halfvec(768)`) yields $\approx 55\%$ total storage savings. Under canonical Profile P4 (forced-HNSW), FP16 Extended achieves Recall@10 of 0.985 / 0.995 (1k), 0.960 / 0.980 (5k), and 0.935 / 0.975 (10k) (conventional / tie-aware), exhibiting a mild scale-dependent retrieval decline while maintaining $>0.975$ tie-aware recall across all evaluated scales. Across all 660 query-condition units per scale combined, scale-level mean Recall@10 reaches 0.9914 / 0.9605 / 0.9394 (conventional) and 0.9971 / 0.9847 / 0.9758 (tie-aware).
+1. **$H_1$ (Storage-Induced Plan Divergence):** Out-of-line TOASTing of `vector(768)` under `STORAGE EXTENDED` lowers main heap pages ($relpages$). Based on inspection of PostgreSQL's `hnswcostestimate` implementation, this represents a supported explanatory mechanism for altered startup-cost calculations, while inline storage (`STORAGE PLAIN` or `halfvec(768)`) retains higher heap page counts.
+2. **$H_2$ (Scale-Dependent Plan Convergence):** At small corpus scales ($N=1{,}001$), planner cost profiles heavily influence path choice (HNSW vs. Seq Scan). At larger evaluated corpus scales ($N \ge 5{,}000$), HNSW index scans are selected 100% of the time across all evaluated cost configurations.
+3. **$H_3$ (Storage and Retrieval Parity of FP16):** Half-precision 16-bit quantization (`halfvec(768)`) yields $\approx 55\%$ total storage savings. Under canonical Profile P4 (forced-HNSW), FP16 Extended achieves Recall@10 of 0.985 / 0.995 (1k), 0.960 / 0.980 (5k), and 0.935 / 0.975 (10k) (conventional / tie-aware), maintaining $\ge 0.975$ tie-aware recall across all evaluated scales. Across all 660 query-condition units per scale combined, scale-level mean Recall@10 reaches 0.9914 / 0.9605 / 0.9394 (conventional) and 0.9971 / 0.9847 / 0.9758 (tie-aware).
 
 ---
 
 ## 2. Experimental Design Matrix
 
-The completed experimental evaluation spans a fully factorial experimental design across corpus scales, data representations, planner cost profiles, and execution modes:
+The experimental evaluation decouples execution-free plan capture from timed query latency:
 
-```
-3 Scales x 3 Representations x 9 Planner Cost Profiles x 3 Execution Modes x 20 Fixed Queries
-```
+- **Planning-Only Plan Captures (Fully Crossed Matrix):** Captured across 3 scales $\times$ 3 representations $\times$ 3 execution modes $\times$ 9 planner cost profiles $\times$ 20 queries = **4,860 plan captures**.
+- **Timed Workload Measurements (Optimized Partial Factorial Design):** Forced-path timing is restricted to the canonical profile (P4) to evaluate representation and scale effects under PostgreSQL default cost parameters, while planner-selected execution is measured across all 9 profiles:
+  - Planner-selected: 3 scales $\times$ 3 representations $\times$ 9 profiles $\times$ 20 queries $\times$ 5 passes = **8,100 timed queries**.
+  - Forced exact: 3 scales $\times$ 3 representations $\times$ Profile P4 $\times$ 20 queries $\times$ 5 passes = **900 timed queries**.
+  - Forced HNSW: 3 scales $\times$ 3 representations $\times$ Profile P4 $\times$ 20 queries $\times$ 5 passes = **900 timed queries**.
+  - Total: **9,900 timed executions**.
+- **Diagnostic EXPLAIN ANALYZE Runs:** 3 scales $\times$ 3 representations $\times$ 3 modes $\times$ Profile P4 $\times$ 20 queries = **540 diagnostic runs**.
 
 ### 2.1 The Three Vector Representations
-1. **`FP32 Extended` (`vector(768)`, `STORAGE EXTENDED`):** Default PostgreSQL representation. Coordinates stored as 32-bit single-precision floats. Observed `pg_column_size` is 3,076 bytes per datum (utilizing 4-byte compressed/toastable varlena header format, vs. theoretical uncompressed $4d + 8 = 3{,}080$ bytes). Tuples exceed the 2 KiB page threshold and are moved out-of-line into TOAST relations.
-2. **`FP32 Plain` (`vector(768)`, `STORAGE PLAIN`):** Inline storage policy enforced via `ALTER TABLE ... SET STORAGE PLAIN`. Observed `pg_column_size` is 3,080 bytes per datum ($4d + 8$ with uncompressed 4-byte header). Forces vectors into main heap blocks (fitting exactly 2 tuples per 8 KiB page), avoiding TOAST overhead while expanding main heap pages.
+1. **`FP32 Extended` (`vector(768)`, `STORAGE EXTENDED`):** Default PostgreSQL representation. Coordinates stored as 32-bit single-precision floats. Observed `pg_column_size` is 3,076 bytes per datum, while theoretical uncompressed datum size is $4d + 8 = 3{,}080$ bytes. While the 3,076-byte measurement is the recorded physical datum size in PostgreSQL, the precise architectural reason for this 4-byte difference was not established by the experimental evidence. Tuples exceed the 2 KiB page threshold and are stored out-of-line in TOAST relations.
+2. **`FP32 Plain` (`vector(768)`, `STORAGE PLAIN`):** Inline storage policy enforced via `ALTER TABLE ... SET STORAGE PLAIN`. Observed `pg_column_size` is 3,080 bytes per datum ($4d + 8$). Forces vectors into main heap blocks (fitting exactly 2 tuples per 8 KiB page), avoiding TOAST overhead while expanding main heap pages.
 3. **`FP16 Extended` (`halfvec(768)`, `STORAGE EXTENDED`):** IEEE 754 16-bit half-precision floating-point coordinates. Observed `pg_column_size` is 1,544 bytes per datum ($2d + 8$). Sits naturally below the 2 KiB page threshold, remaining 100% inline within main heap blocks.
 
 ### 2.2 The Nine Planner Cost Profiles
@@ -57,11 +61,6 @@ Cost parameters are dimensionless relative units normalized to $seq\_page\_cost 
 - **Invariants:** `hnsw.ef_search = 40`, `max_parallel_workers_per_gather = 0`, `LIMIT = 10`, `HNSW parameters: m=16, ef_construction=64`.
 - **Query Set:** 20 pre-generated MS MARCO semantic queries with precomputed 768-dimensional embeddings.
 - **Passes:** 2 unmeasured warm-up passes, 5 measured passes per query.
-
-### 2.3 Workload Execution Accounting
-- **Timed Executions:** 9,900 queries (8,100 planner-selected + 900 forced exact + 900 forced HNSW).
-- **Execution-Free Plan Captures:** 4,860 JSON plan captures via `EXPLAIN (SETTINGS, FORMAT JSON)`.
-- **Diagnostic Executions:** 540 detailed runs via `EXPLAIN (ANALYZE, BUFFERS, SETTINGS, FORMAT JSON)` under Profile P4.
 
 ---
 
@@ -139,7 +138,7 @@ At $N=1{,}001$, representation storage layout directly alters path selection:
 - `fp32_plain`: Selected HNSW Index Scan in **440 of 540** cases (81.5%) and Seq Scan in 100 cases.
 - `fp16_extended`: Selected HNSW Index Scan in **440 of 540** cases (81.5%) and Seq Scan in 100 cases.
 
-**Key Finding:** Sequential scans were chosen **exclusively** at the 1,001-row scale. At scales 5,000 and 10,000, the PostgreSQL query planner selected HNSW Index Scan 100% of the time across all 9 profiles and all representations.
+**Key Finding:** Sequential scans were chosen **exclusively** at the 1,001-row scale. At scales 5,000 and 10,000, the PostgreSQL query planner selected HNSW Index Scan 100% of the time across all 9 profiles and all representations within the evaluated matrix.
 
 ---
 
@@ -180,9 +179,9 @@ Descriptive statistics are computed over the 100 timed executions per condition 
 | **10,000** | `fp32_plain` | Planner Selected | 100 | 2.785 | 7.157 | 3.433 | 1.919 |
 
 ### 6.2 Latency Insights
-1. **TOAST Overhead in Sequential Scan:** In exact sequential scan, `fp32_extended` incurs severe latency penalties due to out-of-line TOAST pointer dereferencing (91.95 ms P50 at 10k vs 53.56 ms P50 for `fp32_plain` and 12.77 ms P50 for `fp16_extended`).
+1. **TOAST Overhead in Sequential Scan:** In exact sequential scan, `fp32_extended` incurs substantial latency penalties due to out-of-line TOAST pointer dereferencing (91.95 ms P50 at 10k vs 53.56 ms P50 for `fp32_plain` and 12.77 ms P50 for `fp16_extended`).
 2. **HNSW Convergence:** Under HNSW index scans, median latency remains between 1.59 ms and 2.88 ms across all representations and scales.
-3. **FP16 Advantage at Scale:** At 10,000 rows, `fp16_extended` achieves the lowest P50 latency (2.45 ms planner-selected, 2.48 ms forced HNSW).
+3. **FP16 Performance at Scale:** At 10,000 rows, `fp16_extended` achieved the lowest observed P50 latency (2.45 ms planner-selected, 2.48 ms forced HNSW).
 
 ---
 
@@ -200,7 +199,7 @@ Under the canonical planner profile (P4) with forced HNSW index scan, `FP16 Exte
 | **5,000** | 0.960 | 0.980 |
 | **10,000** | 0.935 | 0.975 |
 
-*Retrieval Observation:* FP16 retrieval accuracy exhibits a mild scale-dependent decline as corpus size increases (0.985 $\to$ 0.960 $\to$ 0.935 conventional; 0.995 $\to$ 0.980 $\to$ 0.975 tie-aware). Boundary tie-aware adjustment substantially recovers nearest-neighbor parity across all evaluated scales.
+*Retrieval Observation:* FP16 retrieval accuracy exhibits a mild scale-dependent decline as corpus size increases (0.985 $\to$ 0.960 $\to$ 0.935 conventional; 0.995 $\to$ 0.980 $\to$ 0.975 tie-aware). Boundary tie-aware adjustment substantially recovers nearest-neighbor parity across all evaluated scales ($\ge 0.975$ across all scales).
 
 ### 7.2 Overall Scale-Level Means Across All 660 Query-Condition Units Per Scale
 
@@ -219,12 +218,12 @@ The table below summarizes retrieval metrics computed across all 660 query-condi
 | **10,000** | $1.0 \times 10^{-7}$ | 660 | 33 | 0.9394 | 0.9758 | +0.0364 |
 
 ### 7.3 Boundary-Tie Analysis & Numerical Tolerance Sensitivity
-1. **Tolerance Invariance Across Two Orders of Magnitude:** The evaluated tolerances ($\tau \in \{10^{-5}, 10^{-6}, 10^{-7}\}$) span 2 orders of magnitude (a factor of 100). The retrieval evaluation is strictly invariant between $\tau = 10^{-7}$ and $\tau = 10^{-6}$ across all 1,980 query-condition units. Widening the tolerance to $\tau = 10^{-5}$ adds exactly one query condition at Scale 5,000 (Query ID 17), shifting scale-5,000 mean tie-aware recall from 0.9847 to 0.9864.
+1. **Tolerance Sensitivity Across Evaluated Settings:** Evaluated tolerances ($\tau \in \{10^{-7}, 10^{-6}, 10^{-5}\}$) span 2 orders of magnitude (a factor of 100). Retrieval results were strictly identical between $\tau = 10^{-7}$ and $\tau = 10^{-6}$ across all 1,980 query-condition units. Widening the tolerance to $\tau = 10^{-5}$ identified one additional boundary-tie case at Scale 5,000 (Query ID 17), shifting scale-5,000 mean tie-aware recall from 0.9847 to 0.9864.
 2. **Deterministic Query Attribution (0-Based Query IDs):** Exact sequential scan ground-truth analysis identifies specific queries exhibiting boundary distance ties across the 20-query suite:
    - **Scale 1,001:** Query IDs 5, 13, 16 (e.g. Query 5 boundary distance $0.473267$ with 4 chunks tied for 1 boundary slot).
    - **Scale 5,000:** Query IDs 3, 9 (e.g. Query 3 boundary distance $0.406328$ with 12 chunks tied for 8 slots; Query 9 with 12 chunks tied for 10 slots). Widening to $\tau = 10^{-5}$ introduces Query ID 17 (boundary distance $0.452952$ with 2 chunks tied for 1 slot).
    - **Scale 10,000:** Query ID 9 (boundary distance $0.443279$ with 28 chunks tied for 8 boundary slots).
-3. **Relational Mechanism of Boundary Ties:** PostgreSQL executes vector top-$K$ queries via `ORDER BY distance ASC LIMIT 10` without a secondary deterministic tie-breaking key (such as `chunk_id`). When multiple candidate tuples share identical floating-point distance to the query vector at the rank-10 boundary, the relational executor arbitrates ties non-deterministically based on physical page order. Conventional set-intersection Recall@10 penalizes valid nearest neighbors that happen to be arbitrated out of the top 10; tie-aware Recall@10 credits any candidate whose distance matches the rank-10 boundary distance within tolerance $\tau$.
+3. **Relational Mechanism of Boundary Ties:** PostgreSQL executes vector top-$K$ queries via `ORDER BY distance ASC LIMIT 10` without a secondary deterministic tie-breaking key (such as `chunk_id`). When multiple candidate tuples share identical floating-point distance to the query vector at the rank-10 boundary, the relational executor arbitrates ties based on physical page order. Conventional set-intersection Recall@10 penalizes valid nearest neighbors that happen to be arbitrated out of the top 10; tie-aware Recall@10 credits any candidate whose distance matches the rank-10 boundary distance within tolerance $\tau$.
 
 ---
 
@@ -271,24 +270,24 @@ Following Phase 2A audit corrections, buffer statistics are extracted exclusivel
 Statistical testing is conducted using the 20 query-level experimental units ($N=20$).
 
 ### 9.1 Friedman Test Across 9 Cost Profiles (Benjamini-Hochberg Adjusted)
-Tests whether planner cost profiles produce statistically significant latency differences under planner-selected execution, evaluated across the 9 experimental strata with Benjamini-Hochberg (BH) false discovery rate control:
+Tests whether planner cost profiles produce statistically significant latency differences under planner-selected execution, evaluated across the 9 experimental strata with standard Friedman tie correction and Benjamini-Hochberg (BH) false discovery rate control:
 
-| Scale | Representation | Friedman $Q$ Stat | $df$ | Raw $p$-value | BH-Adjusted $p$ | Outcome ($\alpha = 0.05$) |
-| :---: | :--- | :---: | :---: | :---: | :---: | :---: |
-| **1,001** | `fp32_extended` | 50.547 | 8 | $3.21 \times 10^{-8}$ | **$< 0.001$** ($2.89 \times 10^{-7}$) | **Statistically Significant** |
-| **1,001** | `fp32_plain` | 25.267 | 8 | $1.40 \times 10^{-3}$ | **$0.0063$** | **Statistically Significant** |
-| **1,001** | `fp16_extended` | 15.547 | 8 | $4.93 \times 10^{-2}$ | $0.1480$ | Not Significant |
-| **5,000** | `fp32_extended` | 8.160 | 8 | 0.418 | $0.6270$ | Not Significant |
-| **5,000** | `fp32_plain` | 6.000 | 8 | 0.647 | $0.6860$ | Not Significant |
-| **5,000** | `fp16_extended` | 9.467 | 8 | 0.304 | $0.5480$ | Not Significant |
-| **10,000** | `fp32_extended` | 5.653 | 8 | 0.686 | $0.6860$ | Not Significant |
-| **10,000** | `fp32_plain` | 6.720 | 8 | 0.567 | $0.6860$ | Not Significant |
-| **10,000** | `fp16_extended` | 10.507 | 8 | 0.231 | $0.5203$ | Not Significant |
+| Scale | Representation | Friedman $Q$ Stat | $C_{\text{ties}}$ | $df$ | Raw $p$-value | BH-Adjusted $p$ | Outcome ($\alpha = 0.05$) |
+| :---: | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| **1,001** | `fp32_extended` | 50.547 | 1.0000 | 8 | $3.21 \times 10^{-8}$ | **$< 0.001$** ($2.89 \times 10^{-7}$) | **Statistically Significant** |
+| **1,001** | `fp32_plain` | 25.267 | 1.0000 | 8 | $1.40 \times 10^{-3}$ | **$0.0063$** | **Statistically Significant** |
+| **1,001** | `fp16_extended` | 15.547 | 1.0000 | 8 | $4.93 \times 10^{-2}$ | $0.1480$ | Not Significant |
+| **5,000** | `fp32_extended` | 8.160 | 1.0000 | 8 | 0.418 | $0.6270$ | Not Significant |
+| **5,000** | `fp32_plain` | 6.000 | 1.0000 | 8 | 0.647 | $0.6860$ | Not Significant |
+| **5,000** | `fp16_extended` | 9.467 | 1.0000 | 8 | 0.304 | $0.5480$ | Not Significant |
+| **10,000** | `fp32_extended` | 5.653 | 1.0000 | 8 | 0.686 | $0.6860$ | Not Significant |
+| **10,000** | `fp32_plain` | 6.720 | 1.0000 | 8 | 0.567 | $0.6860$ | Not Significant |
+| **10,000** | `fp16_extended` | 10.507 | 1.0000 | 8 | 0.231 | $0.5203$ | Not Significant |
 
-**Inference:** After controlling the false discovery rate across all 9 strata via Benjamini-Hochberg adjustment, cost profile sensitivity remains statistically significant only for `FP32 Extended` ($p_{\text{adj}} < 0.001$) and `FP32 Plain` ($p_{\text{adj}} = 0.0063$) at 1,001 rows. For `FP16 Extended` at 1,001 rows, the unadjusted raw $p = 0.0493$ fails to survive multiple comparison correction ($p_{\text{adj}} = 0.1480$). At $N \ge 5{,}000$, cost profile changes produce no plan alterations (HNSW index scan is chosen 100% of the time), resulting in no statistically significant latency variance across profiles ($p_{\text{adj}} \ge 0.52$).
+*Note on Ties:* In the empirical query-level latency data, all 9 profile latencies per query are distinct continuous values, resulting in $C_{\text{ties}} = 1.0000$. After controlling the false discovery rate across all 9 strata via Benjamini-Hochberg adjustment, cost profile sensitivity remains statistically significant only for `FP32 Extended` ($p_{\text{adj}} < 0.001$) and `FP32 Plain` ($p_{\text{adj}} = 0.0063$) at 1,001 rows. For `FP16 Extended` at 1,001 rows, the unadjusted raw $p = 0.0493$ fails to survive multiple comparison correction ($p_{\text{adj}} = 0.1480$). At $N \ge 5{,}000$, cost profile changes produce no plan alterations (HNSW index scan is chosen 100% of the time), resulting in no statistically significant latency variance across profiles ($p_{\text{adj}} \ge 0.52$).
 
 ### 9.2 Paired Wilcoxon Signed-Rank Tests (Profile P4, Forced HNSW)
-Comparing FP16 vs. FP32 representations across the 20 queries under canonical Profile P4 with Holm-Bonferroni step-down correction ($\alpha = 0.05$). Monotonicity is enforced via forward cumulative maximum ($p_{\text{adj}, i} = \min(1.0, \max_{k \le i} q_k)$). Effect sizes are quantified using the matched-pairs rank-biserial correlation $r_{\text{rb}}$, where negative values indicate FP16 latency is lower than FP32:
+Comparing FP16 vs. FP32 representations across the 20 queries under canonical Profile P4 with zero-difference handling, continuity correction, tie-corrected variance, and Holm-Bonferroni step-down correction ($\alpha = 0.05$). Monotonicity is enforced via forward cumulative maximum ($p_{\text{adj}, i} = \min(1.0, \max_{k \le i} q_k)$). Effect sizes are quantified using the matched-pairs rank-biserial correlation $r_{\text{rb}}$, where negative values indicate FP16 latency is lower than FP32:
 
 | Scale | Comparison | $W$ Stat | Raw $p$-value | Holm-Adjusted $p$ | Rank-Biserial $r_{\text{rb}}$ | Outcome ($\alpha = 0.05$) |
 | :---: | :--- | :---: | :---: | :---: | :---: | :---: |
@@ -302,9 +301,11 @@ Comparing FP16 vs. FP32 representations across the 20 queries under canonical Pr
 **Inference:** Only the comparison between FP16 Extended and FP32 Plain at the 10,000-row scale achieves statistical significance after Holm adjustment ($p_{\text{adj}} = 0.0257, r_{\text{rb}} = -0.733$). At smaller scales and against FP32 Extended, latency differences between FP16 and FP32 under forced HNSW scan do not survive family-wise error rate control.
 
 ### 9.3 Major Exact vs. Forced-HNSW Latency Inference under Profile P4
-To quantify the latency penalty of exact sequential scans versus forced HNSW index scans under canonical Profile P4, paired differences were analyzed across queries using a 30,000-iteration query-cluster bootstrap with Benjamini-Hochberg false discovery rate control:
+To quantify the latency difference between exact sequential scans and forced HNSW index scans under canonical Profile P4, paired differences were analyzed across queries.
 
-| Scale | Representation | Mean Diff (ms) | 95% Bootstrap CI (ms) | Speedup Factor | 95% Bootstrap CI (Speedup) | BH-Adjusted $p$ | Outcome ($\alpha = 0.05$) |
+*Methodological Distinction:* The 95% Confidence Intervals for Mean Difference (ms) and Speedup Factor are estimated via **30,000 query-cluster bootstrap resamples**. Inferential $p$-values are computed from **paired query-level Wilcoxon signed-rank tests ($N=20$)** with **Benjamini-Hochberg (BH) False Discovery Rate control**. Reported BH-adjusted $p$-values are derived from the Wilcoxon tests and are NOT bootstrap-derived $p$-values:
+
+| Scale | Representation | Mean Diff (ms) | 95% Bootstrap CI (ms) | Speedup Factor | 95% Bootstrap CI (Speedup) | BH-Adjusted Wilcoxon $p$ | Outcome ($\alpha = 0.05$) |
 | :---: | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
 | **1,001** | `fp32_extended` | $+4.173$ | $[+3.064, +5.867]$ | $3.09\times$ | $[2.39\times, 4.13\times]$ | **$1.23 \times 10^{-4}$** | **Statistically Significant** |
 | **1,001** | `fp32_plain` | $+0.215$ | $[+0.072, +0.363]$ | $1.11\times$ | $[1.04\times, 1.20\times]$ | **$0.0244$** | **Statistically Significant** |
@@ -316,9 +317,7 @@ To quantify the latency penalty of exact sequential scans versus forced HNSW ind
 | **10,000** | `fp32_plain` | $+49.250$ | $[+47.323, +51.086]$ | $14.87\times$ | $[13.30\times, 16.81\times]$ | **$1.23 \times 10^{-4}$** | **Statistically Significant** |
 | **10,000** | `fp16_extended` | $+11.476$ | $[+9.864, +13.102]$ | $5.13\times$ | $[4.45\times, 5.86\times]$ | **$1.23 \times 10^{-4}$** | **Statistically Significant** |
 
-**Inference:** 8 of 9 exact-vs-forced-HNSW comparisons survive Benjamini-Hochberg adjustment ($p_{\text{adj}} < 0.05$). The sole exception is `FP16 Extended` at 1,001 rows (mean difference $+0.108$ ms, 95% CI $[-0.014, +0.236]$ ms, speedup $1.06\times$, 95% CI $[0.99\times, 1.14\times]$, BH $p = 0.1978$). No recall comparison between exact and forced HNSW is statistically tested because exact sequential scan defines the reference truth (Recall = 1.0).
-
-*Analysis Provenance:* Advanced inferential outputs (30,000-cluster bootstrap, Holm step-down cumulative maximum, and Benjamini-Hochberg adjustment) are computed by `scripts/analysis/analyze_phase3_sensitivity.py` using the immutable Phase 2 and Phase 3A evidence.
+**Inference:** 8 of 9 exact-vs-forced-HNSW comparisons survive Benjamini-Hochberg adjustment ($p_{\text{adj}} < 0.05$). The sole exception is `FP16 Extended` at 1,001 rows (mean difference $+0.108$ ms, 95% CI $[-0.014, +0.236]$ ms, speedup $1.06\times$, 95% CI $[0.99\times, 1.14\times]$, BH $p_{\text{adj}} = 0.1978$). No recall comparison between exact and forced HNSW is statistically tested because exact sequential scan defines the reference truth (Recall = 1.0).
 
 ---
 
@@ -327,9 +326,9 @@ To quantify the latency penalty of exact sequential scans versus forced HNSW ind
 1. **Query Sample Size ($N=20$):** Evaluation utilized 20 representative MS MARCO semantic queries. While multi-pass repeated timing yielded 100 observations per condition, semantic variance across broader query workloads requires further evaluation.
 2. **Warm-Cache Operating Regime:** Benchmark executions evaluated warmed buffer-cache behavior to measure algorithmic and planner efficiency. Cold-cache I/O from spinning disks or cold cloud volumes was not benchmarked.
 3. **Single-Host Environment:** Experiments ran on a dedicated Windows workstation under PostgreSQL 18.4 on `x86_64`. Distributed PostgreSQL architectures (e.g. Citus) were not evaluated.
-4. **Corpus Scale Scope:** The largest evaluated corpus size in this study is $N=10{,}000$ tuples. While this scale clearly demonstrates the convergence of planner path selections and TOAST overhead, multi-million-row production-scale corpora may encounter secondary memory or index cache spill behaviors not captured here.
+4. **Corpus Scale Scope:** The largest evaluated corpus size in this study is $N=10{,}000$ tuples. Multi-million-row production-scale corpora may encounter secondary memory or index cache spill behaviors not evaluated here.
 5. **ANN-Only Scope:** Retrieval quality focused on vector similarity Recall@10. Downstream generative LLM answer fidelity (RAG answer quality) was not evaluated.
-6. **No Physical Hardware Emulation Claims:** Cost profiles represent query planner cost adjustments, not physical hardware emulation. No unmeasured claims are made regarding hardware memory-bus saturation, SIMD execution efficiency, or physical SSD/NVMe speedup parity.
+6. **No Direct Hardware Claims:** The observed latency reduction under `halfvec` operations was associated with reduced physical storage footprint and higher tuple density per page; however, isolating specific hardware or architectural mechanisms (such as memory-bus bandwidth or SIMD vectorization) was outside the empirical scope of this study. Cost profiles represent query planner cost adjustments, not hardware simulations.
 
 ---
 

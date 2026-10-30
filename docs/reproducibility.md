@@ -86,13 +86,13 @@ Expected output:
 
 ## 3. Unit & Integration Test Suite
 
-Run the complete 115-test test suite:
+Run the complete 120-test test suite:
 ```bash
 pytest -v
 ```
 Expected output:
 ```
-============================ 115 passed in ~26s =============================
+============================ 120 passed in ~28s =============================
 ```
 
 ---

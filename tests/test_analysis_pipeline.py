@@ -10,6 +10,10 @@ Unit and integration tests for the statistical analysis and evidence reproductio
   - Holm step-down family-wise error rate adjustment with cumulative maximum.
   - Known test case where unadjusted Holm products are non-monotonic.
   - Matched rank-biserial correlation and directionality.
+  - Friedman test with standard tie correction formula and without ties.
+  - Wilcoxon signed-rank test with tie-corrected variance and zero-difference handling.
+  - Wilcoxon signed-rank test when all differences are zero.
+  - Agreement with verified reference calculations for representative inputs.
   - Cross-validation of all 27 Profile P4 summary statistics against immutable summary_results.csv.
 """
 
@@ -23,6 +27,7 @@ from collections import defaultdict
 from scripts.analysis.analyze_phase3_sensitivity import (
     benjamini_hochberg,
     holm_step_down,
+    friedman_test,
     wilcoxon_signed_rank,
     chi2_sf,
     normal_sf,
@@ -146,6 +151,103 @@ def test_matched_rank_biserial_direction():
     y_sym = [3.0, 1.0, 3.0, 1.0]
     w3, p3, r_rb3 = wilcoxon_signed_rank(x_sym, y_sym)
     assert r_rb3 == 0.0
+
+
+def test_friedman_tie_correction_formula():
+    """
+    Verify Friedman test correctly computes tie correction factor C_ties
+    and appropriately inflates Q_stat when ties are present.
+    """
+    # 3 blocks, 3 treatments:
+    # Row 1: tie of 2 -> 2^3 - 2 = 6
+    # Row 2: tie of 2 -> 6
+    # Row 3: no ties
+    # total_tie_term = 12
+    # n=3, k=3 -> denom = 3 * 3 * (9 - 1) = 72
+    # C_ties = 1 - 12/72 = 5/6 = 0.8333333333333334
+    matrix = [
+        [1.0, 1.0, 2.0],
+        [2.0, 3.0, 3.0],
+        [1.0, 2.0, 3.0]
+    ]
+    q_stat, p_val, c_ties = friedman_test(matrix)
+    assert abs(c_ties - 5.0 / 6.0) < 1e-9
+    assert q_stat > 0.0
+    assert 0.0 <= p_val <= 1.0
+
+
+def test_friedman_no_ties():
+    """
+    Verify Friedman test on untied data produces C_ties = 1.0 exactly
+    and matches analytical uncorrected Q statistic.
+    """
+    matrix = [
+        [10.0, 20.0, 30.0],
+        [12.0, 22.0, 32.0],
+        [11.0, 21.0, 31.0],
+        [13.0, 23.0, 33.0]
+    ]
+    # n = 4 blocks, k = 3 treatments
+    # Ranks in every row: [1, 2, 3] -> rank sums: R_1 = 4, R_2 = 8, R_3 = 12
+    # sum(R_j^2) = 16 + 64 + 144 = 224
+    # Q0 = (12 / (4 * 3 * 4)) * 224 - 3 * 4 * 4 = (12/48)*224 - 48 = 56 - 48 = 8.0
+    q_stat, p_val, c_ties = friedman_test(matrix)
+    assert abs(c_ties - 1.0) < 1e-9
+    assert abs(q_stat - 8.0) < 1e-9
+    assert p_val < 0.05
+
+
+def test_wilcoxon_tie_correction_and_zero_handling():
+    """
+    Verify Wilcoxon signed-rank test discards zero differences (reducing effective n)
+    and applies tie correction to the variance under tied absolute differences.
+    """
+    # 7 pairs, with 1 zero difference and ties among absolute differences:
+    x = [5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 10.0]
+    y = [4.0, 5.0, 5.0, 6.0, 11.0, 12.0, 10.0]
+    # d = x - y: [+1.0, +1.0, +2.0, +2.0, -2.0, -2.0, 0.0]
+    # Pair 7 has d = 0 (discarded!). Effective n = 6.
+    # Non-zero absolute differences:
+    # 1.0 (tie of 2) -> (2^3 - 2) = 6
+    # 2.0 (tie of 4) -> (4^3 - 4) = 60
+    # tie_term = 66
+    # var_w = (6 * 7 * 13 - 0.5 * 66) / 24 = (546 - 33) / 24 = 513 / 24 = 21.375
+    # (Without tie correction: 546 / 24 = 22.75)
+    w, p, r_rb = wilcoxon_signed_rank(x, y)
+    assert 0.0 <= w <= 21.0
+    assert 0.0 <= p <= 1.0
+
+
+def test_wilcoxon_all_zeros():
+    """Verify Wilcoxon test returns safe defaults when all pairs are identical (zero differences)."""
+    x = [1.0, 2.0, 3.0]
+    y = [1.0, 2.0, 3.0]
+    w, p, r_rb = wilcoxon_signed_rank(x, y)
+    assert w == 0.0
+    assert p == 1.0
+    assert r_rb == 0.0
+
+
+def test_reference_calculation_agreement():
+    """
+    Verify that our implementation matches known reference values:
+    For n = 20 paired observations with no ties, where W = 28.0:
+      E[W] = 105.0, Var(W) = 717.5
+      z = (105.0 - 28.0 - 0.5) / sqrt(717.5) = 76.5 / 26.78619 = 2.855949
+      Two-sided p = 2 * normal_sf(2.855949) = 0.0042908
+    """
+    # Create synthetic paired lists that produce W = 28.0 at n = 20:
+    # Ranks 1 to 20 sum to 210.
+    # We assign negative signs to ranks summing to 28 (e.g. ranks 1, 2, 3, 4, 5, 6, 7: sum = 28)
+    diffs = [-i if i <= 7 else i for i in range(1, 21)]
+    x = [float(d) for d in diffs]
+    y = [0.0] * 20
+    w, p, r_rb = wilcoxon_signed_rank(x, y)
+    assert w == 28.0
+    assert abs(p - 0.0042908) < 1e-5
+    # Total sum of ranks = 210. W+ = 182, W- = 28.
+    # r_rb = (182 - 28) / 210 = 154 / 210 = 0.7333333333333333
+    assert abs(r_rb - (154.0 / 210.0)) < 1e-9
 
 
 def test_p4_summary_reconciliation():

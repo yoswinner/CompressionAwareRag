@@ -53,7 +53,7 @@ planner_sensitivity
 - **FP32 (`vector(768)`):**
   - Raw coordinate payload: $768 \times 4 \text{ bytes} = 3{,}072 \text{ bytes}$.
   - Logical datum structure: $3{,}072 + 8 \text{ bytes} = 3{,}080 \text{ bytes}$ (under documented uncompressed $4d + 8$ formula).
-  - Empirically measured storage footprint (`pg_column_size`): $3{,}076 \text{ bytes}$ for `FP32 Extended` (utilizing a 4-byte compressed/toastable varlena header format), and $3{,}080 \text{ bytes}$ for `FP32 Plain` (utilizing the full 8-byte header $4d + 8$).
+  - Empirically measured storage footprint (`pg_column_size`): $3{,}076 \text{ bytes}$ for `FP32 Extended` and $3{,}080 \text{ bytes}$ for `FP32 Plain`. While $3{,}076 \text{ bytes}$ is the recorded physical datum size in PostgreSQL, the precise architectural reason for this 4-byte difference in `FP32 Extended` was not established by the experimental evidence.
   - Out-of-line TOAST threshold: Exceeds the ~2 KiB `TOAST_TUPLE_THRESHOLD` on standard 8 KiB PostgreSQL pages.
 - **FP16 (`halfvec(768)`):**
   - Raw coordinate payload: $768 \times 2 \text{ bytes} = 1{,}536 \text{ bytes}$.
@@ -224,7 +224,7 @@ flowchart LR
 # Verify PostgreSQL and pgvector availability
 psql -U postgres -d compression_aware_rag_scale -c "SELECT extversion FROM pg_extension WHERE extname = 'vector';"
 
-# Run full test suite (115 tests)
+# Run full test suite (120 tests)
 pytest -v
 ```
 

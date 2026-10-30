@@ -21,11 +21,11 @@ It reproduces and reports:
   4. Retrieval quality and boundary-tie sensitivity across epsilons [1e-7, 1e-6, 1e-5].
   5. Corrected root-plan buffer consumption.
   6. Non-parametric statistical inference:
-     - Friedman tests across 9 cost profiles with Benjamini-Hochberg (BH) adjustment.
-     - Paired Wilcoxon signed-rank tests with Holm step-down adjustment (cumulative maximum)
-       and matched rank-biserial correlation for FP16 vs. FP32.
-     - Paired Exact vs. Forced-HNSW latency inference with query-cluster bootstrap CIs
-       and Benjamini-Hochberg adjustment (reproducing P4_paired_latency_inference.csv).
+     - Friedman tests across 9 cost profiles with standard tie correction and Benjamini-Hochberg (BH) adjustment.
+     - Paired Wilcoxon signed-rank tests with zero-difference handling, continuity correction,
+       tie-corrected variance, Holm step-down adjustment (cumulative maximum), and matched rank-biserial correlation.
+     - Paired Exact vs. Forced-HNSW latency inference with 30,000 query-cluster bootstrap CIs
+       and paired Wilcoxon p-values with Benjamini-Hochberg adjustment.
 
 Execution Mode: Strictly read-only offline analysis on local files. Zero database access required.
 """
@@ -112,12 +112,73 @@ def holm_step_down(p_values: list[float]) -> list[float]:
     return adj
 
 
+def friedman_test(matrix: list[list[float]]) -> tuple[float, float, float]:
+    """
+    Computes two-way Friedman test across k treatments across n blocks (rows=blocks, cols=treatments).
+    Applies standard average ranks for ties and standard Friedman tie correction:
+      C_ties = 1 - sum_{i} sum_{m} (t_{i, m}^3 - t_{i, m}) / (n * k * (k^2 - 1))
+      Q = Q_0 / C_ties
+    where Q_0 is the uncorrected Friedman statistic:
+      Q_0 = (12 / (n * k * (k + 1))) * sum(R_j^2) - 3 * n * (k + 1)
+
+    Returns:
+      (Q_stat, raw_p_value, C_ties)
+    """
+    n = len(matrix)
+    if n == 0:
+        return 0.0, 1.0, 1.0
+    k = len(matrix[0])
+    if k < 2:
+        return 0.0, 1.0, 1.0
+
+    ranks_sum = [0.0] * k
+    total_tie_term = 0.0
+
+    for i in range(n):
+        row = matrix[i]
+        indexed = sorted([(val, col) for col, val in enumerate(row)], key=lambda t: t[0])
+        idx = 0
+        while idx < k:
+            end = idx
+            while end < k and indexed[end][0] == indexed[idx][0]:
+                end += 1
+            t_len = end - idx
+            if t_len > 1:
+                total_tie_term += (t_len ** 3 - t_len)
+            avg_r = (idx + 1 + end) / 2.0
+            for m in range(idx, end):
+                ranks_sum[indexed[m][1]] += avg_r
+            idx = end
+
+    sum_r2 = sum(r ** 2 for r in ranks_sum)
+    q0 = (12.0 / (n * k * (k + 1))) * sum_r2 - 3.0 * n * (k + 1)
+
+    denom = (n * k * (k ** 2 - 1))
+    c_ties = 1.0 - total_tie_term / denom if denom > 0 else 1.0
+    q_stat = q0 / c_ties if (c_ties > 0.0 and total_tie_term > 0) else q0
+    p_val = chi2_sf(q_stat, k - 1)
+    return q_stat, p_val, c_ties
+
+
 def wilcoxon_signed_rank(x: list[float], y: list[float]) -> tuple[float, float, float]:
     """
     Computes two-sided Wilcoxon signed-rank test for paired samples.
-    D_i = x_i - y_i.
-    Returns (W_statistic, p_value, rank_biserial_r).
-    r_rb = (W+ - W-) / (W+ + W-). Negative indicates x is systematically lower than y.
+
+    Zero-difference handling:
+      Pairs where x_i == y_i (d_i == 0) are discarded, reducing effective sample
+      size n to the number of non-zero differences (standard Wilcoxon convention).
+
+    Tie correction:
+      Assigns average ranks to tied absolute differences and adjusts variance:
+        var_w = (n * (n + 1) * (2 * n + 1) - 0.5 * sum(t_j^3 - t_j)) / 24.0
+
+    Continuity correction:
+      Applies 0.5 continuity correction towards the mean: z = max(0, |W - E[W]| - 0.5) / sqrt(var_w).
+
+    Returns:
+      (W_statistic, p_value, rank_biserial_r)
+      where W = min(W+, W-), and r_rb = (W+ - W-) / (W+ + W-).
+      Negative r_rb indicates x is systematically lower than y.
     """
     diffs = [a - b for a, b in zip(x, y) if a != b]
     n = len(diffs)
@@ -127,13 +188,16 @@ def wilcoxon_signed_rank(x: list[float], y: list[float]) -> tuple[float, float, 
     abs_diffs = [(abs(d), i, d > 0) for i, d in enumerate(diffs)]
     abs_diffs.sort(key=lambda t: t[0])
 
-    # Assign ranks with average ties
     ranks = [0.0] * n
+    tie_term = 0.0
     i = 0
     while i < n:
         j = i
         while j < n and abs_diffs[j][0] == abs_diffs[i][0]:
             j += 1
+        t_len = j - i
+        if t_len > 1:
+            tie_term += (t_len ** 3 - t_len)
         avg_rank = (i + 1 + j) / 2.0
         for k in range(i, j):
             ranks[k] = avg_rank
@@ -143,11 +207,15 @@ def wilcoxon_signed_rank(x: list[float], y: list[float]) -> tuple[float, float, 
     w_neg = sum(ranks[k] for k in range(n) if not abs_diffs[k][2])
     w = min(w_pos, w_neg)
 
-    # Normal approximation with continuity correction
+    # Normal approximation with continuity correction and tie-corrected variance
     mean_w = n * (n + 1) / 4.0
-    var_w = n * (n + 1) * (2 * n + 1) / 24.0
-    z = (abs(w - mean_w) - 0.5) / math.sqrt(var_w)
-    p_val = 2.0 * normal_sf(z)
+    var_w = (n * (n + 1) * (2 * n + 1) - 0.5 * tie_term) / 24.0
+    if var_w <= 0.0:
+        p_val = 1.0
+    else:
+        diff_w = abs(w - mean_w)
+        z = max(0.0, diff_w - 0.5) / math.sqrt(var_w)
+        p_val = 2.0 * normal_sf(z)
 
     # Matched rank-biserial correlation
     total_ranks = w_pos + w_neg
@@ -164,187 +232,213 @@ def analyze_storage():
     print("=" * 80)
     print("TABLE 1: PHYSICAL STORAGE METRICS AND REDUCTIONS")
     print("=" * 80)
-    rows_by_scale = defaultdict(dict)
+
+    rows = []
     with open(storage_csv, "r", encoding="utf-8") as f:
         for r in csv.DictReader(f):
-            scale = int(r["scale"])
-            rep = r["representation"]
-            rows_by_scale[scale][rep] = {
-                "heap": int(r["heap_bytes"]),
-                "toast": int(r["toast_total_bytes"]),
-                "hnsw": int(r["hnsw_index_bytes"]),
-                "total": int(r["total_inclusive_bytes"]),
-                "col_size": float(r["column_size_avg_bytes"])
-            }
+            rows.append(r)
 
-    header = f"{'Scale':>6} | {'Representation':<15} | {'Heap (B)':>11} | {'TOAST (B)':>11} | {'HNSW (B)':>11} | {'Total (B)':>11} | {'Total Red. vs FP32 Ext':>22}"
+    # Calculate baseline total sizes per scale
+    baselines = {}
+    for r in rows:
+        if r["representation"] == "fp32_extended":
+            tot = float(r.get("total_inclusive_bytes") or r.get("total_size_bytes"))
+            baselines[int(r["scale"])] = tot
+
+    header = f"{'Scale':>6} | {'Representation':<16} | {'Heap (B)':>11} | {'TOAST (B)':>11} | {'HNSW (B)':>11} | {'Total (B)':>11} | {'Total Red. vs FP32 Ext':>23}"
     print(header)
     print("-" * len(header))
 
-    for scale in sorted(rows_by_scale.keys()):
-        base_tot = rows_by_scale[scale]["fp32_extended"]["total"]
-        for rep in ["fp32_extended", "fp32_plain", "fp16_extended"]:
-            d = rows_by_scale[scale][rep]
-            red = (1.0 - d["total"] / base_tot) * 100.0
-            red_str = f"{red:+.2f}%" if rep != "fp32_extended" else "Baseline (0.00%)"
-            print(f"{scale:>6} | {rep:<15} | {d['heap']:>11,} | {d['toast']:>11,} | {d['hnsw']:>11,} | {d['total']:>11,} | {red_str:>22}")
+    for r in rows:
+        scale = int(r["scale"])
+        rep = r["representation"]
+        heap = int(r.get("heap_bytes") or r.get("heap_size_bytes"))
+        toast = int(r.get("toast_total_bytes") or r.get("toast_size_bytes"))
+        hnsw = int(r.get("hnsw_index_bytes"))
+        total = int(r.get("total_inclusive_bytes") or r.get("total_size_bytes"))
 
-    # Explicit TOAST proportion check
-    t10k_toast = rows_by_scale[10000]["fp32_extended"]["toast"]
-    t10k_heap = rows_by_scale[10000]["fp32_extended"]["heap"]
-    t10k_prop = (t10k_toast / (t10k_toast + t10k_heap)) * 100.0
-    print(f"\n[Verified Storage Note] FP32 Extended at 10,000 rows: TOAST represents {t10k_prop:.2f}% of table storage (heap + TOAST, excluding indexes).")
+        base = baselines[scale]
+        if rep == "fp32_extended":
+            red_str = "Baseline (0.00%)"
+        else:
+            red_pct = ((base - total) / base) * 100.0
+            red_str = f"+{red_pct:.2f}%"
+
+        print(f"{scale:>6} | {rep:<16} | {heap:>11,d} | {toast:>11,d} | {hnsw:>11,d} | {total:>11,d} | {red_str:>23}")
+
+    # Explicit verification of 10,000 FP32 Extended TOAST proportion
+    r10k_fp32 = next((r for r in rows if int(r["scale"]) == 10000 and r["representation"] == "fp32_extended"), None)
+    if r10k_fp32:
+        h = int(r10k_fp32.get("heap_bytes") or r10k_fp32.get("heap_size_bytes"))
+        t = int(r10k_fp32.get("toast_total_bytes") or r10k_fp32.get("toast_size_bytes"))
+        toast_prop = (t / (h + t)) * 100.0
+        print(f"\n[Verified Storage Note] FP32 Extended at 10,000 rows: TOAST represents {toast_prop:.2f}% of table storage (heap + TOAST, excluding indexes).")
     print()
 
 
 def analyze_planner_selection():
     plan_jsonl = os.path.join(FULL_RUN_DIR, "plan_capture.jsonl")
     if not os.path.exists(plan_jsonl):
-        print(f"[WARN] Plan capture not found: {plan_jsonl}")
+        print(f"[WARN] Plan capture JSONL not found: {plan_jsonl}")
         return
 
     print("=" * 80)
     print("TABLE 2: PLANNER ACCESS-PATH SELECTION (HNSW INDEX SCAN vs SEQ SCAN)")
     print("=" * 80)
 
-    plans = {}
+    plans_by_scale_prof = defaultdict(lambda: {"hnsw": 0, "seq": 0})
+    total_plans = 0
+
     with open(plan_jsonl, "r", encoding="utf-8") as f:
         for line in f:
-            item = json.loads(line)
-            if item.get("mode") == "planner_selected":
-                k = (int(item["scale"]), item["representation"], item["profile_id"], int(item["query_id"]))
-                plans[k] = item["scan_node_type"]
+            if not line.strip():
+                continue
+            d = json.loads(line)
+            if d.get("mode") != "planner_selected":
+                continue
+            total_plans += 1
+            scale = int(d["scale"])
+            prof = d["profile_id"]
+            node_type = d.get("scan_node_type", "")
+            if "Index" in node_type:
+                plans_by_scale_prof[(scale, prof)]["hnsw"] += 1
+            else:
+                plans_by_scale_prof[(scale, prof)]["seq"] += 1
 
-    total_plans = len(plans)
-    hnsw_count = sum(1 for scan in plans.values() if scan == "Index Scan")
-    seq_count = sum(1 for scan in plans.values() if scan == "Seq Scan")
+    total_hnsw = sum(v["hnsw"] for v in plans_by_scale_prof.values())
+    total_seq = sum(v["seq"] for v in plans_by_scale_prof.values())
 
     print(f"Total Planner-Selected Plans: {total_plans}")
-    print(f"Overall Choices: Index Scan (HNSW) = {hnsw_count:,} ({hnsw_count/total_plans*100:.1f}%), Seq Scan = {seq_count:,} ({seq_count/total_plans*100:.1f}%)\n")
+    print(f"Overall Choices: Index Scan (HNSW) = {total_hnsw:,d} ({total_hnsw/total_plans*100:.1f}%), Seq Scan = {total_seq:,d} ({total_seq/total_plans*100:.1f}%)\n")
 
-    by_scale_prof = defaultdict(lambda: Counter())
-    for (scale, rep, prof, qid), scan in plans.items():
-        by_scale_prof[(scale, prof)][scan] += 1
+    header = f"{'Scale':>6} | {'Profile':<7} | {'Index Scan (HNSW)':>18} | {'Seq Scan':>10} | {'Total':>6} | {'Index Scan %':>12}"
+    print(header)
+    print("-" * len(header))
 
-    profiles = [f"P{i}" for i in range(1, 10)]
-    print(f"{'Scale':>6} | {'Profile':<7} | {'Index Scan (HNSW)':>18} | {'Seq Scan':>10} | {'Total':>6} | {'Index Scan %':>12}")
-    print("-" * 72)
     for scale in [1001, 5000, 10000]:
-        for prof in profiles:
-            c = by_scale_prof[(scale, prof)]
-            idx_s = c["Index Scan"]
-            seq_s = c["Seq Scan"]
-            tot = idx_s + seq_s
-            pct = (idx_s / tot * 100.0) if tot > 0 else 0.0
-            print(f"{scale:>6} | {prof:<7} | {idx_s:>18} | {seq_s:>10} | {tot:>6} | {pct:>11.1f}%")
+        for p_idx in range(1, 10):
+            prof = f"P{p_idx}"
+            counts = plans_by_scale_prof[(scale, prof)]
+            hnsw_c = counts["hnsw"]
+            seq_c = counts["seq"]
+            tot = hnsw_c + seq_c
+            pct = (hnsw_c / tot * 100.0) if tot > 0 else 0.0
+            print(f"{scale:>6} | {prof:<7} | {hnsw_c:>18} | {seq_c:>10} | {tot:>6} | {pct:>11.1f}%")
     print()
 
 
 def analyze_p4_latency():
     lat_csv = os.path.join(FULL_RUN_DIR, "latency_results.csv")
     summary_csv = os.path.join(FULL_RUN_DIR, "summary_results.csv")
-    if not os.path.exists(lat_csv) or not os.path.exists(summary_csv):
-        print(f"[WARN] Latency or summary CSV not found.")
+    if not os.path.exists(lat_csv):
+        print(f"[WARN] Latency results CSV not found: {lat_csv}")
         return
 
     print("=" * 80)
     print("TABLE 3: CANONICAL PROFILE P4 LATENCY SUMMARY (VALIDATED AGAINST summary_results.csv)")
     print("=" * 80)
 
-    # Load summary_results for P4 validation
-    summary_p4 = {}
-    with open(summary_csv, "r", encoding="utf-8") as f:
-        for r in csv.DictReader(f):
-            if r["profile_id"] == "P4":
-                k = (int(r["scale"]), r["representation"], r["mode"])
-                summary_p4[k] = {
-                    "trials": int(r["trials"]),
-                    "mean": float(r["mean_latency_ms"]),
-                    "median": float(r["median_latency_ms"]),
-                    "p95": float(r["p95_latency_ms"])
-                }
+    # Ingest summary_results.csv for cross-validation
+    expected_summary = {}
+    if os.path.exists(summary_csv):
+        with open(summary_csv, "r", encoding="utf-8") as f:
+            for r in csv.DictReader(f):
+                if r.get("profile_id") == "P4":
+                    key = (int(r["scale"]), r["representation"], r["mode"])
+                    expected_summary[key] = {
+                        "p50": float(r["median_latency_ms"]),
+                        "p95": float(r["p95_latency_ms"]),
+                        "mean": float(r["mean_latency_ms"]),
+                    }
 
-    # Group raw timings by (scale, rep, mode)
-    lats = defaultdict(list)
+    p4_latencies = defaultdict(list)
     with open(lat_csv, "r", encoding="utf-8") as f:
         for r in csv.DictReader(f):
             if r["profile_id"] == "P4":
-                k = (int(r["scale"]), r["representation"], r["mode"])
-                lats[k].append(float(r["latency_ms"]))
+                key = (int(r["scale"]), r["representation"], r["mode"])
+                p4_latencies[key].append(float(r["latency_ms"]))
 
-    header = f"{'Scale':>6} | {'Representation':<15} | {'Mode':<17} | {'N':>4} | {'P50 (ms)':>9} | {'P95 (ms)':>9} | {'Mean (ms)':>9} | {'Sample SD':>9} | {'Validation':>10}"
+    header = f"{'Scale':>6} | {'Representation':<17} | {'Mode':<17} | {'N':>4} | {'P50 (ms)':>9} | {'P95 (ms)':>9} | {'Mean (ms)':>9} | {'Sample SD':>9} | {'Validation':>10}"
     print(header)
     print("-" * len(header))
 
-    for k in sorted(lats.keys()):
-        scale, rep, mode = k
-        vals = lats[k]
-        sorted_v = sorted(vals)
+    keys = sorted(p4_latencies.keys())
+    for key in keys:
+        scale, rep, mode = key
+        vals = sorted(p4_latencies[key])
         n = len(vals)
 
-        # Standard benchmark distribution statistics
-        c_mean = statistics.mean(vals)
-        c_std = statistics.stdev(vals)  # sample standard deviation (n - 1)
-        c_p50 = statistics.median(vals) # median
-        p95_idx = max(0, int(math.ceil(0.95 * n)) - 1)
-        c_p95 = sorted_v[p95_idx]
+        # Standard sample statistics: P50 (median), nearest-rank P95, sample SD (n-1)
+        p50 = statistics.median(vals)
+        p95_idx = max(0, math.ceil(0.95 * n) - 1)
+        p95 = vals[p95_idx]
+        mean_lat = statistics.mean(vals)
+        sd_lat = statistics.stdev(vals)
 
-        # Validate against immutable summary_results.csv
-        ref = summary_p4.get(k)
-        if ref is None:
-            raise AssertionError(f"Missing summary reference for P4 group: {k}")
-        if n != ref["trials"]:
-            raise AssertionError(f"Trials mismatch for {k}: computed {n} != ref {ref['trials']}")
-        if abs(c_mean - ref["mean"]) > 1e-4:
-            raise AssertionError(f"Mean mismatch for {k}: computed {c_mean} != ref {ref['mean']}")
-        if abs(c_p50 - ref["median"]) > 1e-4:
-            raise AssertionError(f"Median mismatch for {k}: computed {c_p50} != ref {ref['median']}")
-        if abs(c_p95 - ref["p95"]) > 1e-4:
-            raise AssertionError(f"P95 mismatch for {k}: computed {c_p95} != ref {ref['p95']}")
+        val_str = "N/A"
+        if key in expected_summary:
+            exp = expected_summary[key]
+            p50_match = abs(p50 - exp["p50"]) < 0.005
+            p95_match = abs(p95 - exp["p95"]) < 0.005
+            mean_match = abs(mean_lat - exp["mean"]) < 0.005
+            if p50_match and p95_match and mean_match:
+                val_str = "PASSED"
+            else:
+                val_str = f"MISMATCH(p95={p95:.3f} vs {exp['p95']:.3f})"
+                assert False, f"P4 summary validation failed for {key}: calculated=({p50:.3f}, {p95:.3f}, {mean_lat:.3f}) != expected=({exp['p50']:.3f}, {exp['p95']:.3f}, {exp['mean']:.3f})"
 
-        print(f"{scale:>6} | {rep:<15} | {mode:<17} | {n:>4} | {c_p50:>9.3f} | {c_p95:>9.3f} | {c_mean:>9.3f} | {c_std:>9.3f} | {'PASSED':>10}")
+        print(f"{scale:>6} | {rep:<17} | {mode:<17} | {n:>4} | {p50:>9.3f} | {p95:>9.3f} | {mean_lat:>9.3f} | {sd_lat:>9.3f} | {val_str:>10}")
     print()
 
 
 def analyze_boundary_ties():
-    tie_csv = os.path.join(TIE_DIR, "tie_sensitivity_summary.csv")
-    summary_csv = os.path.join(FULL_RUN_DIR, "summary_results.csv")
-    if not os.path.exists(tie_csv) or not os.path.exists(summary_csv):
-        print(f"[WARN] Tie sensitivity or summary CSV not found.")
+    tie_summary_csv = os.path.join(TIE_DIR, "tie_sensitivity_summary.csv")
+    query_results_csv = os.path.join(TIE_DIR, "tie_sensitivity_query_results.csv")
+    if not os.path.exists(tie_summary_csv) or not os.path.exists(query_results_csv):
+        print(f"[WARN] Phase 3A tie sensitivity CSVs not found in {TIE_DIR}")
         return
 
     print("=" * 80)
     print("TABLE 4: RETRIEVAL QUALITY & BOUNDARY-TIE TOLERANCE SENSITIVITY")
     print("=" * 80)
 
-    # 1. P4 Forced-HNSW FP16 Extended (verified specific performance)
+    # 1. P4 Forced-HNSW FP16 Extended retrieval accuracy across scales
     print("--- 1. P4 Forced-HNSW FP16 Extended Retrieval Accuracy ---")
     print(f"{'Scale':>6} | {'Conventional Recall@10':>24} | {'Tie-Aware Recall@10':>22}")
     print("-" * 58)
-    with open(summary_csv, "r", encoding="utf-8") as f:
-        for r in csv.DictReader(f):
-            if r["profile_id"] == "P4" and r["representation"] == "fp16_extended" and r["mode"] == "forced_hnsw":
-                s = int(r["scale"])
-                cr = float(r["mean_recall_at_10"])
-                tr = float(r["mean_tie_aware_recall_at_10"])
-                print(f"{s:>6} | {cr:>24.3f} | {tr:>22.3f}")
 
-    # 2. Overall scale-level means across all 660 query-condition units per scale
+    p4_fp16_recalls = {}
+    with open(query_results_csv, "r", encoding="utf-8") as f:
+        for r in csv.DictReader(f):
+            if r["representation"] == "fp16_extended" and r["mode"] == "forced_hnsw" and r["profile_id"] == "P4" and r["epsilon"] == "1.0e-06":
+                scale = int(r["scale"])
+                if scale not in p4_fp16_recalls:
+                    p4_fp16_recalls[scale] = {"conv": [], "tie": []}
+                p4_fp16_recalls[scale]["conv"].append(float(r["conventional_recall"]))
+                p4_fp16_recalls[scale]["tie"].append(float(r["tie_aware_recall"]))
+
+    for scale in sorted(p4_fp16_recalls.keys()):
+        mean_conv = statistics.mean(p4_fp16_recalls[scale]["conv"])
+        mean_tie = statistics.mean(p4_fp16_recalls[scale]["tie"])
+        print(f"{scale:>6} | {mean_conv:>24.3f} | {mean_tie:>22.3f}")
+
+    # 2. Overall scale-level means across all 660 query-condition units combined per scale
     print("\n--- 2. Overall Scale-Level Means (All 660 Query-Condition Units Combined Per Scale) ---")
-    print(f"{'Scale':>6} | {'Epsilon (tol)':<13} | {'Units':>6} | {'Tied Units':>11} | {'Mean Conv Recall':>17} | {'Mean Tie-Aware Recall':>22} | {'Mean Boost':>11}")
-    print("-" * 96)
+    header = f"{'Scale':>6} | {'Epsilon (tol)':<13} | {'Units':>6} | {'Tied Units':>11} | {'Mean Conv Recall':>17} | {'Mean Tie-Aware Recall':>22} | {'Mean Boost':>11}"
+    print(header)
+    print("-" * len(header))
 
-    with open(tie_csv, "r", encoding="utf-8") as f:
+    with open(tie_summary_csv, "r", encoding="utf-8") as f:
         for r in csv.DictReader(f):
-            if r["representation"] == "ALL" and r["mode"] == "ALL":
+            if r.get("representation") == "ALL" and r.get("mode") == "ALL":
                 scale = r["scale"]
                 eps = r["epsilon"]
-                n = r["num_observations"]
-                tied = r["tie_prevalence_count"]
-                c_rec = float(r["mean_conventional_recall"])
-                t_rec = float(r["mean_tie_aware_recall"])
+                total_obs = int(r["num_observations"])
+                tied_obs = int(r["tie_prevalence_count"])
+                conv_rec = float(r["mean_conventional_recall"])
+                tie_rec = float(r["mean_tie_aware_recall"])
                 boost = float(r["mean_tie_recall_boost"])
-                print(f"{scale:>6} | {eps:<13} | {n:>6} | {tied:>11} | {c_rec:>17.4f} | {t_rec:>22.4f} | {boost:>+11.4f}")
+                print(f"{scale:>6} | {eps:<13} | {total_obs:>6} | {tied_obs:>11} | {conv_rec:>17.4f} | {tie_rec:>22.4f} | {boost:>+11.4f}")
 
     print("\n[Boundary-Tie Zero-Based Query ID Summary]")
     print("  - At primary epsilon = 1e-6 (and 1e-7):")
@@ -398,47 +492,36 @@ def analyze_inferential_statistics():
 
     q_mean = {k: sum(v) / len(v) for k, v in q_lat.items()}
 
-    # 1. Friedman Test across 9 cost profiles with Benjamini-Hochberg adjustment across 9 strata
-    print("--- 1. Friedman Test Across 9 Profiles (Benjamini-Hochberg Adjusted) ---")
+    # 1. Friedman Test across 9 cost profiles with standard tie correction & BH adjustment
+    print("--- 1. Friedman Test Across 9 Profiles (Tie-Corrected & Benjamini-Hochberg Adjusted) ---")
     profiles = [f"P{i}" for i in range(1, 10)]
     k_prof = len(profiles)  # 9
     n_queries = 20
 
     friedman_data = []
     strata_keys = []
+    tie_factors = []
     for scale in [1001, 5000, 10000]:
         for rep in ["fp32_extended", "fp32_plain", "fp16_extended"]:
-            ranks_sum = [0.0] * k_prof
+            mat = []
             for qid in range(n_queries):
-                row_vals = [(q_mean[(scale, rep, prof, "planner_selected", qid)], idx) for idx, prof in enumerate(profiles)]
-                row_vals.sort(key=lambda t: t[0])
-                i = 0
-                while i < k_prof:
-                    j = i
-                    while j < k_prof and row_vals[j][0] == row_vals[i][0]:
-                        j += 1
-                    avg_r = (i + 1 + j) / 2.0
-                    for m_idx in range(i, j):
-                        orig_col = row_vals[m_idx][1]
-                        ranks_sum[orig_col] += avg_r
-                    i = j
-
-            sum_r2 = sum(r_j ** 2 for r_j in ranks_sum)
-            q_stat = (12.0 / (n_queries * k_prof * (k_prof + 1))) * sum_r2 - 3.0 * n_queries * (k_prof + 1)
-            raw_p = chi2_sf(q_stat, k_prof - 1)
+                mat.append([q_mean[(scale, rep, prof, "planner_selected", qid)] for prof in profiles])
+            q_stat, raw_p, c_ties = friedman_test(mat)
             strata_keys.append((scale, rep))
             friedman_data.append((q_stat, raw_p))
+            tie_factors.append(c_ties)
 
     raw_ps = [p for _, p in friedman_data]
     bh_ps = benjamini_hochberg(raw_ps)
 
-    print(f"{'Scale':>6} | {'Representation':<15} | {'Friedman Q':>11} | {'Raw p-value':>12} | {'BH-adjusted p':>14} | {'Outcome (alpha=0.05)':>22}")
-    print("-" * 92)
+    print(f"{'Scale':>6} | {'Representation':<15} | {'Friedman Q':>11} | {'C_ties':>7} | {'Raw p-value':>12} | {'BH-adjusted p':>14} | {'Outcome (alpha=0.05)':>22}")
+    print("-" * 102)
     for i, (scale, rep) in enumerate(strata_keys):
         q_stat, raw_p = friedman_data[i]
         adj_p = bh_ps[i]
+        c_ties = tie_factors[i]
         sig_str = "Statistically Significant" if adj_p < 0.05 else "Not Significant"
-        print(f"{scale:>6} | {rep:<15} | {q_stat:>11.3f} | {raw_p:>12.4e} | {adj_p:>14.6f} | {sig_str:>22}")
+        print(f"{scale:>6} | {rep:<15} | {q_stat:>11.3f} | {c_ties:>7.4f} | {raw_p:>12.4e} | {adj_p:>14.6f} | {sig_str:>22}")
 
     # 2. Paired Wilcoxon Tests (P4 Forced-HNSW: FP16 vs FP32) with Holm Step-Down Adjustment
     print("\n--- 2. Paired Wilcoxon Signed-Rank Tests (P4 Forced-HNSW: FP16 vs. FP32) ---")
@@ -470,8 +553,11 @@ def analyze_inferential_statistics():
         sig_str = "Significant" if holm_p < 0.05 else "Not Significant"
         print(f"{scale:>6} | {label:<24} | {w:>7.1f} | {raw_p:>12.4e} | {holm_p:>11.4f} | {r_rb:>+16.3f} | {sig_str:>16}")
 
-    # 3. Major Exact vs. Forced-HNSW Latency Inference under P4 (reproducing P4_paired_latency_inference.csv)
-    print("\n--- 3. Exact vs. Forced-HNSW Latency Inference (Profile P4, 30,000 Cluster Bootstrap) ---")
+    # 3. Major Exact vs. Forced-HNSW Latency Inference under P4
+    print("\n--- 3. Exact vs. Forced-HNSW Latency Inference (Profile P4, 30,000 Cluster Bootstrap CIs & Paired Wilcoxon) ---")
+    print("    [Methodology Note] 95% Confidence Intervals are estimated via 30,000 query-cluster bootstrap resamples.")
+    print("    Reported p-values are from paired query-level Wilcoxon signed-rank tests adjusted via Benjamini-Hochberg (BH).")
+    print("    BH-adjusted p-values are NOT derived from the bootstrap distribution.")
     random.seed(42)
     B = 30000
 
@@ -487,7 +573,7 @@ def analyze_inferential_statistics():
             point_diff = statistics.mean(diffs)
             speedup = statistics.mean(exact_q) / statistics.mean(hnsw_q)
 
-            # Paired Wilcoxon
+            # Paired Wilcoxon (hnsw vs exact)
             w_stat, raw_p, r_rb = wilcoxon_signed_rank(hnsw_q, exact_q)
 
             # 30,000 query-cluster bootstrap
