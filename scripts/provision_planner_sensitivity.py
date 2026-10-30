@@ -41,6 +41,10 @@ from src.config import get_db_connection_string
 
 SCHEMA_NAME = "planner_sensitivity"
 
+EXPECTED_HNSW_M = 16
+EXPECTED_HNSW_EF_CONSTRUCTION = 64
+TARGET_MAINTENANCE_WORK_MEM = "512MB"
+
 ALLOWED_DATABASES = {
     "compression_aware_rag_exp",
     "compression_aware_rag_scale",
@@ -218,13 +222,37 @@ def validate_chunk_id_equivalence(conn: psycopg.Connection, scale_tag: str) -> d
         }
 
 
-def check_target_scale_state(conn: psycopg.Connection, scale_tag: str) -> str:
+def parse_reloptions(options_list: list[str] | None) -> dict:
+    """Parses pg_class.reloptions list like ['m=16', 'ef_construction=64'] into a dict."""
+    if not options_list:
+        return {}
+    res = {}
+    for opt in options_list:
+        if "=" in opt:
+            k, v = opt.split("=", 1)
+            try:
+                res[k.strip()] = int(v.strip())
+            except ValueError:
+                res[k.strip()] = v.strip()
+    return res
+
+
+def check_target_scale_state(conn: psycopg.Connection, scale_tag: str, expected_count: int | None = None) -> str:
     """
     Checks the existing state of target tables and indexes for a scale.
+    Fails closed if any invariant is violated.
     Returns:
       - 'clean': No tables or indexes exist. Ready for provisioning.
-      - 'fully_provisioned': All 3 tables and 3 indexes exist and have valid structure.
-      - 'partial': Inconsistent state (some tables or indexes exist, or row counts mismatch).
+      - 'fully_provisioned': All 3 tables and 3 indexes exist and meet all invariants:
+          1. Exact expected row count in all three tables.
+          2. Column types vector(768) / halfvec(768) and 768-dimensional embeddings.
+          3. Correct storage policies (PLAIN for fp32_plain, EXTENDED for others).
+          4. Correct HNSW access method ('hnsw').
+          5. Correct operator classes (vector_cosine_ops / halfvec_cosine_ops).
+          6. Valid index status (indisvalid = true).
+          7. HNSW parameters m=16 and ef_construction=64.
+          8. 100% chunk ID parity across all three tables.
+      - 'partial': Inconsistent or partial state. Provisioning must abort before writing.
     """
     tbls = [f"chunks_{scale_tag}_{rep}" for rep in REPRESENTATIONS]
     idxs = [f"chunks_{scale_tag}_{rep}_hnsw_idx" for rep in REPRESENTATIONS]
@@ -232,16 +260,107 @@ def check_target_scale_state(conn: psycopg.Connection, scale_tag: str) -> str:
     existing_tbls = [t for t in tbls if check_table_exists(conn, SCHEMA_NAME, t)]
     existing_idxs = [i for i in idxs if check_index_exists(conn, SCHEMA_NAME, i)]
 
+    # Clean state: zero tables and zero indexes exist
     if len(existing_tbls) == 0 and len(existing_idxs) == 0:
         return "clean"
 
-    if len(existing_tbls) == 3 and len(existing_idxs) == 3:
-        parity_check = validate_chunk_id_equivalence(conn, scale_tag)
-        if parity_check.get("valid"):
-            return "fully_provisioned"
+    # If some objects exist but not all 6, it is partial
+    if len(existing_tbls) != 3 or len(existing_idxs) != 3:
         return "partial"
 
-    return "partial"
+    # Resolve expected row count
+    if expected_count is None:
+        spec = SCALE_SPECS.get(str(scale_tag))
+        if spec and "expected_count" in spec:
+            expected_count = spec["expected_count"]
+        else:
+            try:
+                expected_count = int(scale_tag)
+            except ValueError:
+                return "partial"
+
+    if expected_count is None or expected_count <= 0:
+        return "partial"
+
+    with conn.cursor() as cur:
+        for rep in REPRESENTATIONS:
+            tbl_name = f"chunks_{scale_tag}_{rep}"
+            idx_name = f"{tbl_name}_hnsw_idx"
+            is_halfvec = "fp16" in rep
+            expected_type = "halfvec(768)" if is_halfvec else "vector(768)"
+            expected_storage_char = "p" if rep == "fp32_plain" else "x"
+            expected_opclass = "halfvec_cosine_ops" if is_halfvec else "vector_cosine_ops"
+
+            # 1. Exact row count
+            cur.execute(sql.SQL("SELECT COUNT(*) FROM {schema}.{table};").format(
+                schema=sql.Identifier(SCHEMA_NAME),
+                table=sql.Identifier(tbl_name)
+            ))
+            actual_rows = cur.fetchone()[0]
+            if actual_rows != expected_count:
+                return "partial"
+
+            # 2. Column type and 768-dim embeddings
+            cur.execute("""
+                SELECT format_type(a.atttypid, a.atttypmod)
+                FROM pg_attribute a
+                JOIN pg_class c ON a.attrelid = c.oid
+                JOIN pg_namespace n ON c.relnamespace = n.oid
+                WHERE n.nspname = %s AND c.relname = %s AND a.attname = 'embedding';
+            """, (SCHEMA_NAME, tbl_name))
+            col_row = cur.fetchone()
+            if not col_row or col_row[0] != expected_type:
+                return "partial"
+
+            cur.execute(sql.SQL("SELECT DISTINCT vector_dims(embedding) FROM {schema}.{table};").format(
+                schema=sql.Identifier(SCHEMA_NAME),
+                table=sql.Identifier(tbl_name)
+            ))
+            dims = [r[0] for r in cur.fetchall()]
+            if dims != [768]:
+                return "partial"
+
+            # 3. Storage policy
+            cur.execute("""
+                SELECT attstorage FROM pg_attribute
+                WHERE attrelid = %s::regclass AND attname = 'embedding';
+            """, (f"{SCHEMA_NAME}.{tbl_name}",))
+            att_row = cur.fetchone()
+            if not att_row or att_row[0] != expected_storage_char:
+                return "partial"
+
+            # 4. HNSW access method, operator class, valid index status, m=16, ef_construction=64
+            cur.execute("""
+                SELECT c.relname, i.indisvalid, opc.opcname, am.amname, c.reloptions
+                FROM pg_index i
+                JOIN pg_class c ON c.oid = i.indexrelid
+                JOIN pg_class t ON t.oid = i.indrelid
+                JOIN pg_namespace n ON n.oid = t.relnamespace
+                JOIN pg_am am ON am.oid = c.relam
+                JOIN pg_opclass opc ON opc.oid = i.indclass[0]
+                WHERE n.nspname = %s AND t.relname = %s AND c.relname = %s;
+            """, (SCHEMA_NAME, tbl_name, idx_name))
+            idx_row = cur.fetchone()
+            if not idx_row:
+                return "partial"
+            idx_valid = bool(idx_row[1])
+            actual_opclass = idx_row[2]
+            am_name = idx_row[3]
+            raw_options = idx_row[4] or []
+
+            if not idx_valid or am_name != "hnsw" or actual_opclass != expected_opclass:
+                return "partial"
+
+            parsed_opts = parse_reloptions(raw_options)
+            if parsed_opts.get("m") != EXPECTED_HNSW_M or parsed_opts.get("ef_construction") != EXPECTED_HNSW_EF_CONSTRUCTION:
+                return "partial"
+
+    # 5. Chunk-ID parity
+    parity_check = validate_chunk_id_equivalence(conn, scale_tag)
+    if not parity_check.get("valid") or parity_check.get("total_rows") != expected_count:
+        return "partial"
+
+    return "fully_provisioned"
 
 
 def inspect_table_metrics(
@@ -408,12 +527,12 @@ def provision_scale(
         print(f"[PRE-FLIGHT] Source table '{source_schema}.{source_table}' verified in '{source_db}': {src_rows} rows (required >= {expected_count}), dimension {src_dims}.")
 
         # 2. Pre-flight target state inspection
-        target_state = check_target_scale_state(conn, scale_tag)
+        target_state = check_target_scale_state(conn, scale_tag, expected_count=expected_count)
         if target_state == "partial":
             raise RuntimeError(
-                f"PARTIAL PRE-EXISTING STATE DETECTED for scale '{scale_tag}' in database '{target_db}'! "
-                f"Inconsistent tables or indexes exist. To prevent data corruption, provisioning has aborted "
-                f"before any write. The provisioner will never automatically DROP existing objects."
+                f"PARTIAL OR INCONSISTENT PRE-EXISTING STATE DETECTED for scale '{scale_tag}' in database '{target_db}'! "
+                f"Inconsistent tables, indexes, types, parameters, or row counts exist. To prevent data corruption, "
+                f"provisioning has aborted before any write. The provisioner will never automatically DROP existing objects."
             )
         elif target_state == "fully_provisioned":
             print(f"[ALREADY PROVISIONED] Scale '{scale_tag}' in '{target_db}' already exists and is verified valid. Skipping.")
@@ -427,6 +546,12 @@ def provision_scale(
         print(f"[TRANSACTION BEGIN] Starting atomic provisioning transaction for scale '{scale_tag}'...")
         try:
             with conn.cursor() as cur:
+                # Explicitly configure transaction-scoped maintenance_work_mem for HNSW index builds
+                cur.execute(sql.SQL("SET LOCAL maintenance_work_mem = {};").format(sql.Literal(TARGET_MAINTENANCE_WORK_MEM)))
+                cur.execute("SHOW maintenance_work_mem;")
+                effective_mwm = cur.fetchone()[0]
+                print(f"  [CONFIG] Transaction maintenance_work_mem configured: {effective_mwm}")
+
                 # Ensure extension and schema
                 cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
                 cur.execute(sql.SQL("CREATE SCHEMA IF NOT EXISTS {};").format(sql.Identifier(SCHEMA_NAME)))

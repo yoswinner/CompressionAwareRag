@@ -1,11 +1,11 @@
 # Precision-Aware Query Planning for Vector Retrieval in PostgreSQL
 ## Experimental and Reproducibility Protocol
 
-**Document Version:** 1.5.0  
+**Document Version:** 1.6.0  
 **Target Venue:** IEEE International Conference on Data Engineering (ICDE) / IEEE Transactions on Knowledge and Data Engineering (TKDE)  
 **Workspace:** `CompressionAwareRag`  
 **Repository Branch:** `research/planner-sensitivity`  
-**PostgreSQL Target:** PostgreSQL 18.x with `pgvector` v0.8.4+
+**PostgreSQL Target:** PostgreSQL 18.x with `pgvector` v0.8.0+
 
 ---
 
@@ -81,12 +81,13 @@ planner_sensitivity
 ### 2.3 Atomic Fail-Closed Provisioning Workflow
 Each scale is provisioned within an isolated transaction (`autocommit=False`) with the following strict execution sequence:
 1. **Source Pre-flight**: Verifies source table existence, row count $\ge \text{expected\_count}$, and 768 vector dimensions before any write.
-2. **Target State Pre-flight**: Checks for pre-existing tables/indexes; aborts before writing if partial state exists; skips safely if fully provisioned. Never automatically drops existing objects.
-3. **Table Creation & Storage Policy**: Creates experimental tables; sets `STORAGE PLAIN` on `fp32_plain` prior to inserting any rows.
-4. **Data Population & HNSW Indexing**: Populates exact chunk rows and builds HNSW graph indexes with explicit cosine operator classes (`vector_cosine_ops` / `halfvec_cosine_ops`).
-5. **In-Transaction Integrity Verification**: Asserts exact row counts, 100% chunk ID parity, storage policies, and index validity.
-6. **In-Transaction ANALYZE**: Executes `ANALYZE` explicitly on all three newly created experimental tables *inside* the transaction before commit, ensuring optimizer statistics are populated as part of the atomic commit.
-7. **Atomic Commit**: `conn.commit()` commits the scale only after all preceding operations succeed. If any step fails (including `ANALYZE`), `conn.rollback()` executes, leaving zero orphan or partial tables.
+2. **Target State Pre-flight**: Checks for pre-existing tables/indexes; aborts before writing if partial or inconsistent state exists; skips safely only if fully verified across all invariants (row counts, types, dimensions, storage policies, opclasses, valid index status, $m=16, ef\_construction=64$, and chunk parity). Never automatically drops existing objects.
+3. **Index Build Memory Configuration**: Sets `SET LOCAL maintenance_work_mem = '512MB';` for the provisioning transaction to ensure in-memory graph construction during index builds (reverts to server default 64MB upon commit or rollback).
+4. **Table Creation & Storage Policy**: Creates experimental tables; sets `STORAGE PLAIN` on `fp32_plain` prior to inserting any rows.
+5. **Data Population & HNSW Indexing**: Populates exact chunk rows and builds HNSW graph indexes with explicit parameters ($m=16, ef\_construction=64$) and cosine operator classes (`vector_cosine_ops` / `halfvec_cosine_ops`).
+6. **In-Transaction Integrity Verification**: Asserts exact row counts, 100% chunk ID parity, column types and dimensions, storage policies, index validity, and HNSW parameters.
+7. **In-Transaction ANALYZE**: Executes `ANALYZE` explicitly on all three newly created experimental tables *inside* the transaction before commit, ensuring optimizer statistics are populated as part of the atomic commit.
+8. **Atomic Commit**: `conn.commit()` commits the scale only after all preceding operations succeed. If any step fails (including `ANALYZE`), `conn.rollback()` executes, leaving zero orphan or partial tables.
 
 ---
 
@@ -94,7 +95,7 @@ Each scale is provisioned within an isolated transaction (`autocommit=False`) wi
 
 ### 3.1 Planner Cost Parameters
 
-PostgreSQL query planning balances sequential page reads against random page reads and CPU operations. Cost values are dimensionless arbitrary relative units (normalized relative to $seq\_page\_cost = 1.0$, which represents the estimated cost of one sequential 8 KiB page fetch):
+PostgreSQL query planning balances estimated sequential page fetches against random page fetches and CPU operations. Cost values are dimensionless arbitrary relative units normalized to $seq\_page\_cost = 1.0$ (the optimizer's arbitrary baseline cost unit). They do not represent an actual physical 8 KiB disk read or measured execution latency:
 
 $$\text{Cost}_{\text{seq}} \approx \text{pages} \times seq\_page\_cost + \text{tuples} \times cpu\_tuple\_cost + \text{tuples} \times cpu\_operator\_cost \quad \text{(Conceptual Model)}$$
 
@@ -178,7 +179,7 @@ flowchart LR
 
 - **Operational Numerical Equivalence Tolerance ($\tau = 1.0 \times 10^{-6}$):**
   - **Predeclared Primary Threshold:** $\tau = 1.0 \times 10^{-6}$.
-  - **Justification:** Serves as an operational numerical-equivalence threshold under IEEE 754 single-precision floating-point dot product and norm accumulation across 768 dimensions. It is documented explicitly as an **operational convention** for tie handling, not as a mathematically proven universal error bound.
+  - **Justification:** Serves as an operational numerical-equivalence threshold for identifying boundary distance ties across 768-dimensional vector dot-product and norm accumulations under hardware floating-point math. It is documented explicitly as an **operational convention** for tie handling, and is not a mathematically proven universal IEEE-754 error bound.
   - **Robustness Sensitivity Analysis:** Evaluated across three distinct thresholds: $\tau \in \{1.0 \times 10^{-7}, 1.0 \times 10^{-6}, 1.0 \times 10^{-5}\}$ from the same retrieved FP32 distance values without redundant database scans. Both primary and sensitivity thresholds are recorded in manifest metadata.
 
 - **Dual Recall Formulation:**
@@ -205,7 +206,7 @@ flowchart LR
 
 ## 5. Statistical & Methodological Discipline
 
-1. **Planner Costs vs. Physical Latency:** PostgreSQL query planner costs are dimensionless arbitrary relative units (normalized relative to $seq\_page\_cost = 1.0$) representing the optimizer's heuristic estimate of I/O and CPU work. They must **never** be conflated with physical execution time in milliseconds.
+1. **Planner Costs vs. Physical Latency & I/O:** PostgreSQL query planner costs are dimensionless arbitrary relative units (normalized relative to $seq\_page\_cost = 1.0$) representing the optimizer's heuristic estimate of I/O and CPU work. They must **never** be equated with physical execution time in milliseconds or an actual physical 8 KiB disk read.
 2. **Pilot Scale Boundaries:** Small-corpus pilots (e.g. 180 chunks) serve exclusively as functional smoke-tests to verify harness mechanics, schema isolation, and parser fidelity. They must **not** be extrapolated to predict 1,001, 5,000, or 10,000-chunk scaling dynamics.
 3. **Sample Size Limitations in Pilots:** While IQR and P95 formulas are computed programmatically, calculating percentiles on a sample size of $N=4$ observations (2 queries × 2 passes) has no statistical significance and serves only to verify arithmetic pipeline schema. Meaningful distribution analysis requires the full multi-pass dataset.
 4. **Recall Fidelity at Scale:** Achieving Recall@10 = 1.0 on 2 queries in a 180-chunk corpus demonstrates only that the search algorithm found the top candidates in a small graph, not that quantization or HNSW approximation maintains 100% recall on 10,000-vector graphs.

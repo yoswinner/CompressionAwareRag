@@ -96,11 +96,9 @@ DEFAULT_RANDOM_SEED = 42
 COSINE_DISTANCE_TOLERANCE = 1e-6
 SENSITIVITY_TOLERANCES = [1e-7, 1e-6, 1e-5]
 TOLERANCE_POLICY = (
-    "1.0e-6 operational numerical-equivalence threshold (with robustness checks at 1e-7 and 1e-5). "
-    "Represents approximate numerical equivalence for IEEE 754 single-precision floating-point dot product "
-    "and norm accumulations across 768 dimensions under hardware and compiler vector math, "
-    "rather than a proven floating-point upper bound. "
-    "Serves as an operational policy to handle boundary distance ties without penalizing equivalent candidates."
+    "1.0e-6 operational numerical-equivalence threshold (with sensitivity checks across 1e-7 and 1e-5). "
+    "Serves as an operational convention for identifying boundary distance ties across 768-dimensional vector dot-product "
+    "and norm accumulations under hardware floating-point math, and is not a mathematically proven IEEE-754 error bound."
 )
 
 
@@ -113,7 +111,8 @@ def generate_cartesian_cost_grid(
     """
     Generates the 9-profile Cartesian cost grid:
     random_page_cost in {1.0, 4.0, 8.0} x cpu_operator_cost in {0.0025, 0.010, 0.050}.
-    Cost values represent arbitrary relative optimizer units where 1.0 = cost of 1 sequential page read.
+    Cost values represent arbitrary relative optimizer units normalized to seq_page_cost = 1.0.
+    They do not represent physical disk reads (such as 8 KiB page fetches) or measured execution latency.
     """
     rpc_list = random_page_costs if random_page_costs is not None else DEFAULT_RANDOM_PAGE_COSTS
     op_list = cpu_operator_costs if cpu_operator_costs is not None else DEFAULT_CPU_OPERATOR_COSTS

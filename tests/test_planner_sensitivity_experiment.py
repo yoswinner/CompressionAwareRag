@@ -1166,6 +1166,7 @@ def test_provisioner_analyze_failure_triggers_rollback():
 
     mock_cur.execute.side_effect = execute_side_effect
     mock_cur.fetchone.side_effect = [
+        ("512MB",),  # SHOW maintenance_work_mem
         (1001,),  # row count check rep 1
         (1001,),  # row count check rep 2
         (1001,),  # row count check rep 3
@@ -1206,10 +1207,243 @@ def test_hnsw_operator_class_validation():
 
 def test_readiness_checker_validates_types_and_opclasses():
     """Verify parse_reloptions and readiness checker logic."""
-    from scripts.verify_table_readiness import parse_reloptions
+    from scripts.verify_table_readiness import parse_reloptions, EXPECTED_HNSW_M, EXPECTED_HNSW_EF_CONSTRUCTION
 
     opts = ["m=16", "ef_construction=64"]
     parsed = parse_reloptions(opts)
     assert parsed == {"m": 16, "ef_construction": 64}
     assert parse_reloptions(None) == {}
+    assert parse_reloptions([]) == {}
+
+
+def test_hnsw_parameter_validation_reloptions():
+    """Verify parse_reloptions and expected HNSW parameters."""
+    from scripts.verify_table_readiness import parse_reloptions, EXPECTED_HNSW_M, EXPECTED_HNSW_EF_CONSTRUCTION
+
+    # Correct options
+    opts = ["m=16", "ef_construction=64"]
+    parsed = parse_reloptions(opts)
+    assert parsed.get("m") == EXPECTED_HNSW_M
+    assert parsed.get("ef_construction") == EXPECTED_HNSW_EF_CONSTRUCTION
+
+    # Incorrect m
+    opts_bad_m = ["m=32", "ef_construction=64"]
+    parsed_bad_m = parse_reloptions(opts_bad_m)
+    assert parsed_bad_m.get("m") != EXPECTED_HNSW_M
+
+    # Incorrect ef_construction
+    opts_bad_ef = ["m=16", "ef_construction=128"]
+    parsed_bad_ef = parse_reloptions(opts_bad_ef)
+    assert parsed_bad_ef.get("ef_construction") != EXPECTED_HNSW_EF_CONSTRUCTION
+
+    # Malformed options
+    opts_malformed = ["m=invalid", "ef_construction=not_an_int"]
+    parsed_malformed = parse_reloptions(opts_malformed)
+    assert parsed_malformed == {"m": "invalid", "ef_construction": "not_an_int"}
+    assert parsed_malformed.get("m") != EXPECTED_HNSW_M
+    assert parsed_malformed.get("ef_construction") != EXPECTED_HNSW_EF_CONSTRUCTION
+
+
+def test_readiness_checker_parameter_validation_scenarios():
+    """Test verify_scale_readiness with correct, incorrect m, incorrect ef, and missing options."""
+    from scripts.verify_table_readiness import verify_scale_readiness
+
+    spec = {
+        "scale": 180,
+        "database": "compression_aware_rag_test",
+        "expected_count": 180
+    }
+
+    def build_mock_cur(raw_options):
+        mock_cur = MagicMock()
+        mock_cur.fetchone.side_effect = [
+            (1,),  # schema exists
+            # rep 1
+            (1,),  # tbl exists
+            (180,),  # rows
+            ("vector(768)",),  # type
+            ("x",),  # storage
+            ("chunks_test_fp32_extended_hnsw_idx", True, "vector_cosine_ops", "hnsw", raw_options),
+            (1000, 2000, 0),  # size
+            (500,),  # idx size
+            # rep 2
+            (1,),  # tbl exists
+            (180,),  # rows
+            ("vector(768)",),  # type
+            ("p",),  # storage
+            ("chunks_test_fp32_plain_hnsw_idx", True, "vector_cosine_ops", "hnsw", raw_options),
+            (1000, 2000, 0),  # size
+            (500,),  # idx size
+            # rep 3
+            (1,),  # tbl exists
+            (180,),  # rows
+            ("halfvec(768)",),  # type
+            ("x",),  # storage
+            ("chunks_test_fp16_extended_hnsw_idx", True, "halfvec_cosine_ops", "hnsw", raw_options),
+            (1000, 2000, 0),  # size
+            (500,),  # idx size
+            # parity check
+            (0,),  # mismatches
+        ]
+        mock_cur.fetchall.side_effect = [
+            [(768,)],  # dims rep 1
+            [(768,)],  # dims rep 2
+            [(768,)],  # dims rep 3
+        ]
+        return mock_cur
+
+    # Scenario 1: Correct options
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = build_mock_cur(["m=16", "ef_construction=64"])
+    with patch("scripts.verify_table_readiness.psycopg.connect", return_value=mock_conn), \
+         patch("scripts.verify_table_readiness.register_vector"):
+        res = verify_scale_readiness("test", spec)
+        assert res["ready"] is True
+        for rep in ["fp32_extended", "fp32_plain", "fp16_extended"]:
+            chk = res["checks"][f"chunks_test_{rep}"]
+            assert chk["params_ok"] is True
+            assert chk["index_parameters"] == {"m": 16, "ef_construction": 64}
+
+    # Scenario 2: Incorrect m (m=32)
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = build_mock_cur(["m=32", "ef_construction=64"])
+    with patch("scripts.verify_table_readiness.psycopg.connect", return_value=mock_conn), \
+         patch("scripts.verify_table_readiness.register_vector"):
+        res = verify_scale_readiness("test", spec)
+        assert res["ready"] is False
+        for rep in ["fp32_extended", "fp32_plain", "fp16_extended"]:
+            chk = res["checks"][f"chunks_test_{rep}"]
+            assert chk["params_ok"] is False
+
+    # Scenario 3: Incorrect ef_construction (ef_construction=128)
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = build_mock_cur(["m=16", "ef_construction=128"])
+    with patch("scripts.verify_table_readiness.psycopg.connect", return_value=mock_conn), \
+         patch("scripts.verify_table_readiness.register_vector"):
+        res = verify_scale_readiness("test", spec)
+        assert res["ready"] is False
+        for rep in ["fp32_extended", "fp32_plain", "fp16_extended"]:
+            chk = res["checks"][f"chunks_test_{rep}"]
+            assert chk["params_ok"] is False
+
+    # Scenario 4: Missing options (raw_options = [])
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = build_mock_cur([])
+    with patch("scripts.verify_table_readiness.psycopg.connect", return_value=mock_conn), \
+         patch("scripts.verify_table_readiness.register_vector"):
+        res = verify_scale_readiness("test", spec)
+        assert res["ready"] is False
+        for rep in ["fp32_extended", "fp32_plain", "fp16_extended"]:
+            chk = res["checks"][f"chunks_test_{rep}"]
+            assert chk["params_ok"] is False
+
+    # Scenario 5: Malformed options
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = build_mock_cur(["m=invalid", "ef_construction=bad"])
+    with patch("scripts.verify_table_readiness.psycopg.connect", return_value=mock_conn), \
+         patch("scripts.verify_table_readiness.register_vector"):
+        res = verify_scale_readiness("test", spec)
+        assert res["ready"] is False
+        for rep in ["fp32_extended", "fp32_plain", "fp16_extended"]:
+            chk = res["checks"][f"chunks_test_{rep}"]
+            assert chk["params_ok"] is False
+
+
+def test_provisioner_check_target_scale_state_hardened_invariants():
+    """Verify check_target_scale_state verifies row counts, types, storage, opclasses, index validity and params."""
+    from scripts.provision_planner_sensitivity import check_target_scale_state
+
+    # Subtest A: All 3 tables and 3 indexes exist, but row count is 900 instead of 1001
+    mock_conn = MagicMock()
+    mock_cur = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cur
+
+    with patch("scripts.provision_planner_sensitivity.check_table_exists", return_value=True), \
+         patch("scripts.provision_planner_sensitivity.check_index_exists", return_value=True):
+        mock_cur.fetchone.return_value = (900,)  # wrong row count
+        state = check_target_scale_state(mock_conn, "1001", expected_count=1001)
+        assert state == "partial"
+
+    # Subtest B: Table exists with wrong HNSW parameters (m=32 instead of 16)
+    mock_conn = MagicMock()
+    mock_cur = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cur
+
+    with patch("scripts.provision_planner_sensitivity.check_table_exists", return_value=True), \
+         patch("scripts.provision_planner_sensitivity.check_index_exists", return_value=True):
+        mock_cur.fetchone.side_effect = [
+            (1001,),  # rows
+            ("vector(768)",),  # col type
+            ("x",),  # storage
+            ("chunks_1001_fp32_extended_hnsw_idx", True, "vector_cosine_ops", "hnsw", ["m=32", "ef_construction=64"]),  # bad m
+        ]
+        mock_cur.fetchall.return_value = [(768,)]
+        state = check_target_scale_state(mock_conn, "1001", expected_count=1001)
+        assert state == "partial"
+
+    # Subtest C: Table exists with invalid index status (indisvalid = False)
+    mock_conn = MagicMock()
+    mock_cur = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cur
+
+    with patch("scripts.provision_planner_sensitivity.check_table_exists", return_value=True), \
+         patch("scripts.provision_planner_sensitivity.check_index_exists", return_value=True):
+        mock_cur.fetchone.side_effect = [
+            (1001,),  # rows
+            ("vector(768)",),  # col type
+            ("x",),  # storage
+            ("chunks_1001_fp32_extended_hnsw_idx", False, "vector_cosine_ops", "hnsw", ["m=16", "ef_construction=64"]),  # invalid index
+        ]
+        mock_cur.fetchall.return_value = [(768,)]
+        state = check_target_scale_state(mock_conn, "1001", expected_count=1001)
+        assert state == "partial"
+
+
+def test_provisioner_sets_local_maintenance_work_mem():
+    """Verify provision_scale configures SET LOCAL maintenance_work_mem = '512MB' inside transaction."""
+    from scripts.provision_planner_sensitivity import provision_scale
+
+    mock_conn = MagicMock()
+    mock_cur = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cur
+
+    spec = {
+        "scale": 1001,
+        "database": "compression_aware_rag_exp",
+        "source_schema": "public",
+        "source_table": "chunks_embedding_fp32",
+        "expected_count": 1001
+    }
+
+    executed_queries = []
+    def record_execute(query, params=None):
+        executed_queries.append(str(query))
+        return None
+
+    mock_cur.execute.side_effect = record_execute
+    mock_cur.fetchone.side_effect = [
+        ("512MB",),  # SHOW maintenance_work_mem
+        (1001,),  # row count check rep 1
+        (1001,),  # row count check rep 2
+        (1001,),  # row count check rep 3
+        ('e',),   # storage policy check rep 1
+        ('p',),   # storage policy check rep 2
+        ('e',),   # storage policy check rep 3
+        ('vector_cosine_ops', True),   # index check rep 1
+        ('vector_cosine_ops', True),   # index check rep 2
+        ('halfvec_cosine_ops', True),  # index check rep 3
+    ]
+
+    with patch("scripts.provision_planner_sensitivity.psycopg.connect", return_value=mock_conn), \
+         patch("scripts.provision_planner_sensitivity.register_vector"), \
+         patch("scripts.provision_planner_sensitivity.assert_approved_database"), \
+         patch("scripts.provision_planner_sensitivity.check_source_table_readiness", return_value=(1001, 768)), \
+         patch("scripts.provision_planner_sensitivity.check_target_scale_state", return_value="clean"), \
+         patch("scripts.provision_planner_sensitivity.validate_chunk_id_equivalence", return_value={"valid": True, "total_rows": 1001, "mismatched_ids": 0}), \
+         patch("scripts.provision_planner_sensitivity.inspect_table_metrics", return_value={"heap_bytes": 1024, "toast_total_bytes": 0, "hnsw_index_bytes": 512}):
+
+        provision_scale("1001", spec, apply=True)
+
+    assert any("maintenance_work_mem" in q and "512MB" in q for q in executed_queries)
+
 

@@ -32,6 +32,9 @@ from src.config import get_db_connection_string
 
 SCHEMA_NAME = "planner_sensitivity"
 
+EXPECTED_HNSW_M = 16
+EXPECTED_HNSW_EF_CONSTRUCTION = 64
+
 ALLOWED_DATABASES = {
     "compression_aware_rag_exp",
     "compression_aware_rag_scale",
@@ -200,6 +203,13 @@ def verify_scale_readiness(scale_tag: str, spec: dict) -> dict:
 
                 opclass_ok = (actual_opclass == expected_opclass and am_name == "hnsw")
 
+                actual_m = parsed_opts.get("m")
+                actual_ef_construction = parsed_opts.get("ef_construction")
+                params_ok = (
+                    actual_m == EXPECTED_HNSW_M and
+                    actual_ef_construction == EXPECTED_HNSW_EF_CONSTRUCTION
+                )
+
                 # Inspect relation storage metadata
                 cur.execute("""
                     SELECT pg_relation_size(c.oid), pg_total_relation_size(c.oid), c.reltoastrelid
@@ -228,7 +238,16 @@ def verify_scale_readiness(scale_tag: str, spec: dict) -> dict:
                     idx_size_row = cur.fetchone()
                     idx_bytes = idx_size_row[0] if idx_size_row else 0
 
-                rep_ok = (rows_ok and type_ok and dims_ok and storage_ok and idx_exists and idx_valid and opclass_ok)
+                rep_ok = (
+                    rows_ok and
+                    type_ok and
+                    dims_ok and
+                    storage_ok and
+                    idx_exists and
+                    idx_valid and
+                    opclass_ok and
+                    params_ok
+                )
                 if not rep_ok:
                     results["ready"] = False
 
@@ -252,6 +271,11 @@ def verify_scale_readiness(scale_tag: str, spec: dict) -> dict:
                     "expected_opclass": expected_opclass,
                     "opclass_ok": opclass_ok,
                     "index_parameters": parsed_opts,
+                    "expected_parameters": {
+                        "m": EXPECTED_HNSW_M,
+                        "ef_construction": EXPECTED_HNSW_EF_CONSTRUCTION
+                    },
+                    "params_ok": params_ok,
                     "heap_bytes": heap_bytes,
                     "toast_bytes": toast_bytes,
                     "hnsw_index_bytes": idx_bytes,
@@ -310,11 +334,15 @@ def main():
         print(f"\n[Scale {s_tag}] Database: {res['database']} => {status_str}")
         for k, v in res["checks"].items():
             if isinstance(v, dict):
+                act_params = v.get("index_parameters", {})
+                exp_params = v.get("expected_parameters", {"m": EXPECTED_HNSW_M, "ef_construction": EXPECTED_HNSW_EF_CONSTRUCTION})
+                params_status = "OK" if v.get("params_ok") else "MISMATCH"
                 print(f"  - {k}: rows={v.get('rows')} ({'OK' if v.get('rows_ok') else 'MISMATCH'}), "
                       f"type={v.get('column_type')} ({'OK' if v.get('type_ok') else 'MISMATCH'}), "
                       f"storage={v.get('storage_policy')} ({'OK' if v.get('storage_ok') else 'INVALID'}), "
                       f"opclass={v.get('operator_class')} ({'OK' if v.get('opclass_ok') else 'INVALID'}), "
-                      f"index={v.get('hnsw_index')} ({'VALID' if v.get('index_valid') else 'MISSING'})")
+                      f"index={v.get('hnsw_index')} ({'VALID' if v.get('index_valid') else 'MISSING'}), "
+                      f"params={act_params} (expected {exp_params}) ({params_status})")
             else:
                 print(f"  - {k}: {v}")
         if not res["ready"]:
