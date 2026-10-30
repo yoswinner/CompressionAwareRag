@@ -197,6 +197,10 @@ def validate_chunk_id_equivalence(conn: psycopg.Connection, scale_tag: str) -> d
                 (SELECT chunk_id FROM {schema}.{t1} EXCEPT SELECT chunk_id FROM {schema}.{t3})
                 UNION ALL
                 (SELECT chunk_id FROM {schema}.{t3} EXCEPT SELECT chunk_id FROM {schema}.{t1})
+                UNION ALL
+                (SELECT chunk_id FROM {schema}.{t2} EXCEPT SELECT chunk_id FROM {schema}.{t3})
+                UNION ALL
+                (SELECT chunk_id FROM {schema}.{t3} EXCEPT SELECT chunk_id FROM {schema}.{t2})
             ) diff;
         """).format(
             schema=sql.Identifier(SCHEMA_NAME),
@@ -291,16 +295,32 @@ def check_target_scale_state(conn: psycopg.Connection, scale_tag: str, expected_
             expected_storage_char = "p" if rep == "fp32_plain" else "x"
             expected_opclass = "halfvec_cosine_ops" if is_halfvec else "vector_cosine_ops"
 
-            # 1. Exact row count
-            cur.execute(sql.SQL("SELECT COUNT(*) FROM {schema}.{table};").format(
+            # 1. Exact row count & distinct chunk_id count
+            cur.execute(sql.SQL("SELECT COUNT(*), COUNT(DISTINCT chunk_id) FROM {schema}.{table};").format(
                 schema=sql.Identifier(SCHEMA_NAME),
                 table=sql.Identifier(tbl_name)
             ))
-            actual_rows = cur.fetchone()[0]
-            if actual_rows != expected_count:
+            actual_rows, distinct_rows = cur.fetchone()
+            if actual_rows != expected_count or distinct_rows != actual_rows:
                 return "partial"
 
-            # 2. Column type and 768-dim embeddings
+            # 2. Valid primary key on chunk_id
+            cur.execute("""
+                SELECT c.conname, cardinality(c.conkey)
+                FROM pg_constraint c
+                JOIN pg_class t ON c.conrelid = t.oid
+                JOIN pg_namespace n ON t.relnamespace = n.oid
+                JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY(c.conkey)
+                WHERE n.nspname = %s
+                  AND t.relname = %s
+                  AND c.contype = 'p'
+                  AND a.attname = 'chunk_id';
+            """, (SCHEMA_NAME, tbl_name))
+            pk_row = cur.fetchone()
+            if not pk_row or pk_row[1] != 1:
+                return "partial"
+
+            # 3. Column type and 768-dim embeddings
             cur.execute("""
                 SELECT format_type(a.atttypid, a.atttypmod)
                 FROM pg_attribute a
@@ -648,13 +668,30 @@ def provision_scale(
                 print("  - Verifying in-transaction post-population integrity...")
                 for rep in REPRESENTATIONS:
                     tbl_name = f"chunks_{scale_tag}_{rep}"
-                    cur.execute(sql.SQL("SELECT COUNT(*) FROM {schema}.{table};").format(
+                    cur.execute(sql.SQL("SELECT COUNT(*), COUNT(DISTINCT chunk_id) FROM {schema}.{table};").format(
                         schema=sql.Identifier(SCHEMA_NAME),
                         table=sql.Identifier(tbl_name)
                     ))
-                    act_cnt = cur.fetchone()[0]
+                    act_cnt, dist_cnt = cur.fetchone()
                     if act_cnt != expected_count:
                         raise RuntimeError(f"Row count assertion failed on {tbl_name}: expected {expected_count}, got {act_cnt}")
+                    if dist_cnt != act_cnt:
+                        raise RuntimeError(f"Duplicate chunk IDs detected in {tbl_name}: distinct={dist_cnt}, total={act_cnt}")
+
+                    cur.execute("""
+                        SELECT c.conname, cardinality(c.conkey)
+                        FROM pg_constraint c
+                        JOIN pg_class t ON c.conrelid = t.oid
+                        JOIN pg_namespace n ON t.relnamespace = n.oid
+                        JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY(c.conkey)
+                        WHERE n.nspname = %s
+                          AND t.relname = %s
+                          AND c.contype = 'p'
+                          AND a.attname = 'chunk_id';
+                    """, (SCHEMA_NAME, tbl_name))
+                    pk_info = cur.fetchone()
+                    if not pk_info or pk_info[1] != 1:
+                        raise RuntimeError(f"Primary key assertion failed on {tbl_name}: expected single-column primary key on chunk_id")
 
                 val = validate_chunk_id_equivalence(conn, scale_tag)
                 if not val["valid"]:

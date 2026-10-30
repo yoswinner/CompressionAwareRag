@@ -85,7 +85,7 @@ Each scale is provisioned within an isolated transaction (`autocommit=False`) wi
 3. **Index Build Memory Configuration**: Sets `SET LOCAL maintenance_work_mem = '512MB';` for the provisioning transaction to ensure in-memory graph construction during index builds (reverts to server default 64MB upon commit or rollback).
 4. **Table Creation & Storage Policy**: Creates experimental tables; sets `STORAGE PLAIN` on `fp32_plain` prior to inserting any rows.
 5. **Data Population & HNSW Indexing**: Populates exact chunk rows and builds HNSW graph indexes with explicit parameters ($m=16, ef\_construction=64$) and cosine operator classes (`vector_cosine_ops` / `halfvec_cosine_ops`).
-6. **In-Transaction Integrity Verification**: Asserts exact row counts, 100% chunk ID parity, column types and dimensions, storage policies, index validity, and HNSW parameters.
+6. **In-Transaction Integrity Verification**: Asserts exact row counts, distinct chunk_id uniqueness (`COUNT(DISTINCT chunk_id) == COUNT(*)`), valid single-column `PRIMARY KEY` on `chunk_id`, 100% bidirectional 6-way chunk ID parity, column types and dimensions, storage policies, index validity, and HNSW parameters.
 7. **In-Transaction ANALYZE**: Executes `ANALYZE` explicitly on all three newly created experimental tables *inside* the transaction before commit, ensuring optimizer statistics are populated as part of the atomic commit.
 8. **Atomic Commit**: `conn.commit()` commits the scale only after all preceding operations succeed. If any step fails (including `ANALYZE`), `conn.rollback()` executes, leaving zero orphan or partial tables.
 

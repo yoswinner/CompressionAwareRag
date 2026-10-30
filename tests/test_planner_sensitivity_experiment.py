@@ -1167,9 +1167,12 @@ def test_provisioner_analyze_failure_triggers_rollback():
     mock_cur.execute.side_effect = execute_side_effect
     mock_cur.fetchone.side_effect = [
         ("512MB",),  # SHOW maintenance_work_mem
-        (1001,),  # row count check rep 1
-        (1001,),  # row count check rep 2
-        (1001,),  # row count check rep 3
+        (1001, 1001),  # row count & distinct count rep 1
+        ("chunks_1001_fp32_extended_pkey", 1),  # PK check rep 1
+        (1001, 1001),  # row count & distinct count rep 2
+        ("chunks_1001_fp32_plain_pkey", 1),  # PK check rep 2
+        (1001, 1001),  # row count & distinct count rep 3
+        ("chunks_1001_fp16_extended_pkey", 1),  # PK check rep 3
         ('e',),   # storage policy check rep 1
         ('p',),   # storage policy check rep 2
         ('e',),   # storage policy check rep 3
@@ -1260,7 +1263,8 @@ def test_readiness_checker_parameter_validation_scenarios():
             (1,),  # schema exists
             # rep 1
             (1,),  # tbl exists
-            (180,),  # rows
+            (180, 180),  # rows & distinct
+            ("chunks_test_fp32_extended_pkey", 1),  # PK
             ("vector(768)",),  # type
             ("x",),  # storage
             ("chunks_test_fp32_extended_hnsw_idx", True, "vector_cosine_ops", "hnsw", raw_options),
@@ -1268,7 +1272,8 @@ def test_readiness_checker_parameter_validation_scenarios():
             (500,),  # idx size
             # rep 2
             (1,),  # tbl exists
-            (180,),  # rows
+            (180, 180),  # rows & distinct
+            ("chunks_test_fp32_plain_pkey", 1),  # PK
             ("vector(768)",),  # type
             ("p",),  # storage
             ("chunks_test_fp32_plain_hnsw_idx", True, "vector_cosine_ops", "hnsw", raw_options),
@@ -1276,7 +1281,8 @@ def test_readiness_checker_parameter_validation_scenarios():
             (500,),  # idx size
             # rep 3
             (1,),  # tbl exists
-            (180,),  # rows
+            (180, 180),  # rows & distinct
+            ("chunks_test_fp16_extended_pkey", 1),  # PK
             ("halfvec(768)",),  # type
             ("x",),  # storage
             ("chunks_test_fp16_extended_hnsw_idx", True, "halfvec_cosine_ops", "hnsw", raw_options),
@@ -1360,7 +1366,7 @@ def test_provisioner_check_target_scale_state_hardened_invariants():
 
     with patch("scripts.provision_planner_sensitivity.check_table_exists", return_value=True), \
          patch("scripts.provision_planner_sensitivity.check_index_exists", return_value=True):
-        mock_cur.fetchone.return_value = (900,)  # wrong row count
+        mock_cur.fetchone.return_value = (900, 900)  # wrong row count
         state = check_target_scale_state(mock_conn, "1001", expected_count=1001)
         assert state == "partial"
 
@@ -1372,7 +1378,8 @@ def test_provisioner_check_target_scale_state_hardened_invariants():
     with patch("scripts.provision_planner_sensitivity.check_table_exists", return_value=True), \
          patch("scripts.provision_planner_sensitivity.check_index_exists", return_value=True):
         mock_cur.fetchone.side_effect = [
-            (1001,),  # rows
+            (1001, 1001),  # rows & distinct
+            ("chunks_1001_fp32_extended_pkey", 1),  # PK
             ("vector(768)",),  # col type
             ("x",),  # storage
             ("chunks_1001_fp32_extended_hnsw_idx", True, "vector_cosine_ops", "hnsw", ["m=32", "ef_construction=64"]),  # bad m
@@ -1389,7 +1396,8 @@ def test_provisioner_check_target_scale_state_hardened_invariants():
     with patch("scripts.provision_planner_sensitivity.check_table_exists", return_value=True), \
          patch("scripts.provision_planner_sensitivity.check_index_exists", return_value=True):
         mock_cur.fetchone.side_effect = [
-            (1001,),  # rows
+            (1001, 1001),  # rows & distinct
+            ("chunks_1001_fp32_extended_pkey", 1),  # PK
             ("vector(768)",),  # col type
             ("x",),  # storage
             ("chunks_1001_fp32_extended_hnsw_idx", False, "vector_cosine_ops", "hnsw", ["m=16", "ef_construction=64"]),  # invalid index
@@ -1423,9 +1431,12 @@ def test_provisioner_sets_local_maintenance_work_mem():
     mock_cur.execute.side_effect = record_execute
     mock_cur.fetchone.side_effect = [
         ("512MB",),  # SHOW maintenance_work_mem
-        (1001,),  # row count check rep 1
-        (1001,),  # row count check rep 2
-        (1001,),  # row count check rep 3
+        (1001, 1001),  # row count & distinct count rep 1
+        ("chunks_1001_fp32_extended_pkey", 1),  # PK check rep 1
+        (1001, 1001),  # row count & distinct count rep 2
+        ("chunks_1001_fp32_plain_pkey", 1),  # PK check rep 2
+        (1001, 1001),  # row count & distinct count rep 3
+        ("chunks_1001_fp16_extended_pkey", 1),  # PK check rep 3
         ('e',),   # storage policy check rep 1
         ('p',),   # storage policy check rep 2
         ('e',),   # storage policy check rep 3
@@ -1445,5 +1456,182 @@ def test_provisioner_sets_local_maintenance_work_mem():
         provision_scale("1001", spec, apply=True)
 
     assert any("maintenance_work_mem" in q and "512MB" in q for q in executed_queries)
+
+
+def test_readiness_checker_primary_key_positive_and_negative():
+    """Verify verify_scale_readiness validates presence of single-column PRIMARY KEY on chunk_id."""
+    from scripts.verify_table_readiness import verify_scale_readiness
+
+    spec = {
+        "scale": 180,
+        "database": "compression_aware_rag_test",
+        "expected_count": 180
+    }
+
+    # Case A: Missing Primary Key
+    mock_cur = MagicMock()
+    mock_cur.fetchone.side_effect = [
+        (1,),  # schema exists
+        (1,),  # tbl exists
+        (180, 180),  # rows & distinct
+        None,  # NO PRIMARY KEY
+        ("vector(768)",),  # type
+        ("x",),  # storage
+        ("chunks_test_fp32_extended_hnsw_idx", True, "vector_cosine_ops", "hnsw", ["m=16", "ef_construction=64"]),
+        (1000, 2000, 0), (500,),
+        # rep 2
+        (1,), (180, 180), ("chunks_test_fp32_plain_pkey", 1), ("vector(768)",), ("p",),
+        ("chunks_test_fp32_plain_hnsw_idx", True, "vector_cosine_ops", "hnsw", ["m=16", "ef_construction=64"]),
+        (1000, 2000, 0), (500,),
+        # rep 3
+        (1,), (180, 180), ("chunks_test_fp16_extended_pkey", 1), ("halfvec(768)",), ("x",),
+        ("chunks_test_fp16_extended_hnsw_idx", True, "halfvec_cosine_ops", "hnsw", ["m=16", "ef_construction=64"]),
+        (1000, 2000, 0), (500,),
+        (0,) # parity
+    ]
+    mock_cur.fetchall.side_effect = [[(768,)], [(768,)], [(768,)]]
+
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cur
+    with patch("scripts.verify_table_readiness.psycopg.connect", return_value=mock_conn), \
+         patch("scripts.verify_table_readiness.register_vector"):
+        res = verify_scale_readiness("test", spec)
+        assert res["ready"] is False
+        assert res["checks"]["chunks_test_fp32_extended"]["pk_ok"] is False
+
+    # Case B: Composite Primary Key (cardinality = 2)
+    mock_cur2 = MagicMock()
+    mock_cur2.fetchone.side_effect = [
+        (1,),  # schema exists
+        (1,),  # tbl exists
+        (180, 180),  # rows & distinct
+        ("composite_pkey", 2),  # COMPOSITE PK (2 columns)
+        ("vector(768)",),  # type
+        ("x",),  # storage
+        ("chunks_test_fp32_extended_hnsw_idx", True, "vector_cosine_ops", "hnsw", ["m=16", "ef_construction=64"]),
+        (1000, 2000, 0), (500,),
+        # rep 2
+        (1,), (180, 180), ("chunks_test_fp32_plain_pkey", 1), ("vector(768)",), ("p",),
+        ("chunks_test_fp32_plain_hnsw_idx", True, "vector_cosine_ops", "hnsw", ["m=16", "ef_construction=64"]),
+        (1000, 2000, 0), (500,),
+        # rep 3
+        (1,), (180, 180), ("chunks_test_fp16_extended_pkey", 1), ("halfvec(768)",), ("x",),
+        ("chunks_test_fp16_extended_hnsw_idx", True, "halfvec_cosine_ops", "hnsw", ["m=16", "ef_construction=64"]),
+        (1000, 2000, 0), (500,),
+        (0,) # parity
+    ]
+    mock_cur2.fetchall.side_effect = [[(768,)], [(768,)], [(768,)]]
+
+    mock_conn2 = MagicMock()
+    mock_conn2.cursor.return_value.__enter__.return_value = mock_cur2
+    with patch("scripts.verify_table_readiness.psycopg.connect", return_value=mock_conn2), \
+         patch("scripts.verify_table_readiness.register_vector"):
+        res = verify_scale_readiness("test", spec)
+        assert res["ready"] is False
+        assert res["checks"]["chunks_test_fp32_extended"]["pk_ok"] is False
+
+
+def test_readiness_checker_duplicate_chunk_ids():
+    """Verify verify_scale_readiness fails closed if COUNT(DISTINCT chunk_id) != COUNT(*)."""
+    from scripts.verify_table_readiness import verify_scale_readiness
+
+    spec = {
+        "scale": 180,
+        "database": "compression_aware_rag_test",
+        "expected_count": 180
+    }
+
+    mock_cur = MagicMock()
+    mock_cur.fetchone.side_effect = [
+        (1,),  # schema exists
+        (1,),  # tbl exists
+        (180, 179),  # DUPLICATE DETECTED: 180 rows, but only 179 distinct chunk_ids!
+        ("chunks_test_fp32_extended_pkey", 1),
+        ("vector(768)",),
+        ("x",),
+        ("chunks_test_fp32_extended_hnsw_idx", True, "vector_cosine_ops", "hnsw", ["m=16", "ef_construction=64"]),
+        (1000, 2000, 0), (500,),
+        # rep 2
+        (1,), (180, 180), ("chunks_test_fp32_plain_pkey", 1), ("vector(768)",), ("p",),
+        ("chunks_test_fp32_plain_hnsw_idx", True, "vector_cosine_ops", "hnsw", ["m=16", "ef_construction=64"]),
+        (1000, 2000, 0), (500,),
+        # rep 3
+        (1,), (180, 180), ("chunks_test_fp16_extended_pkey", 1), ("halfvec(768)",), ("x",),
+        ("chunks_test_fp16_extended_hnsw_idx", True, "halfvec_cosine_ops", "hnsw", ["m=16", "ef_construction=64"]),
+        (1000, 2000, 0), (500,),
+        (0,)
+    ]
+    mock_cur.fetchall.side_effect = [[(768,)], [(768,)], [(768,)]]
+
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cur
+    with patch("scripts.verify_table_readiness.psycopg.connect", return_value=mock_conn), \
+         patch("scripts.verify_table_readiness.register_vector"):
+        res = verify_scale_readiness("test", spec)
+        assert res["ready"] is False
+        assert res["checks"]["chunks_test_fp32_extended"]["distinct_ok"] is False
+
+
+def test_provisioner_check_target_scale_state_pk_and_duplicates():
+    """Verify check_target_scale_state detects missing PK, composite PK, and duplicate IDs."""
+    from scripts.provision_planner_sensitivity import check_target_scale_state
+
+    mock_conn = MagicMock()
+    mock_cur = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cur
+
+    # Case A: Duplicate chunk IDs
+    with patch("scripts.provision_planner_sensitivity.check_table_exists", return_value=True), \
+         patch("scripts.provision_planner_sensitivity.check_index_exists", return_value=True):
+        mock_cur.fetchone.return_value = (1001, 1000)  # duplicate detected
+        state = check_target_scale_state(mock_conn, "1001", expected_count=1001)
+        assert state == "partial"
+
+    # Case B: Missing PK constraint
+    with patch("scripts.provision_planner_sensitivity.check_table_exists", return_value=True), \
+         patch("scripts.provision_planner_sensitivity.check_index_exists", return_value=True):
+        mock_cur.fetchone.side_effect = [
+            (1001, 1001),  # row count OK
+            None,          # NO PRIMARY KEY
+        ]
+        state = check_target_scale_state(mock_conn, "1001", expected_count=1001)
+        assert state == "partial"
+
+    # Case C: Composite PK (cardinality = 2)
+    with patch("scripts.provision_planner_sensitivity.check_table_exists", return_value=True), \
+         patch("scripts.provision_planner_sensitivity.check_index_exists", return_value=True):
+        mock_cur.fetchone.side_effect = [
+            (1001, 1001),  # row count OK
+            ("composite_pk", 2),  # cardinality 2
+        ]
+        state = check_target_scale_state(mock_conn, "1001", expected_count=1001)
+        assert state == "partial"
+
+
+def test_bidirectional_parity_query_scenarios():
+    """Verify bidirectional 6-way set difference logic across all representation pairs."""
+    def compute_6way_diff(t1: set, t2: set, t3: set) -> int:
+        return len(
+            (t1 - t2) | (t2 - t1) |
+            (t1 - t3) | (t3 - t1) |
+            (t2 - t3) | (t3 - t2)
+        )
+
+    # 1. Exact complete parity
+    s1 = {1, 2, 3, 4, 5}
+    s2 = {1, 2, 3, 4, 5}
+    s3 = {1, 2, 3, 4, 5}
+    assert compute_6way_diff(s1, s2, s3) == 0
+
+    # 2. One-way forward mismatch: T1 has an extra ID not in T2
+    assert compute_6way_diff({1, 2, 3, 4, 5, 6}, s2, s3) > 0
+
+    # 3. Reverse-direction mismatch: T2 has an extra ID not in T1
+    assert compute_6way_diff(s1, {1, 2, 3, 4, 5, 7}, s3) > 0
+
+    # 4. Pairwise mismatch between T2 and T3 (T3 has ID not in T2)
+    assert compute_6way_diff(s1, s2, {1, 2, 3, 4, 8}) > 0
+    assert compute_6way_diff(s1, {1, 2, 3, 4, 9}, {1, 2, 3, 4, 8}) > 0
+
 
 

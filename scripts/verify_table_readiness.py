@@ -145,13 +145,31 @@ def verify_scale_readiness(scale_tag: str, spec: dict) -> dict:
                     results["ready"] = False
                     continue
 
-                # Check row count
-                cur.execute(sql.SQL("SELECT COUNT(*) FROM {schema}.{table};").format(
+                # Check row count & distinct chunk_id count
+                cur.execute(sql.SQL("SELECT COUNT(*), COUNT(DISTINCT chunk_id) FROM {schema}.{table};").format(
                     schema=sql.Identifier(SCHEMA_NAME),
                     table=sql.Identifier(tbl_name)
                 ))
-                actual_rows = cur.fetchone()[0]
+                actual_rows, distinct_rows = cur.fetchone()
                 rows_ok = (actual_rows == expected_rows)
+                distinct_ok = (distinct_rows == actual_rows)
+
+                # Check primary key on chunk_id
+                cur.execute("""
+                    SELECT c.conname, cardinality(c.conkey)
+                    FROM pg_constraint c
+                    JOIN pg_class t ON c.conrelid = t.oid
+                    JOIN pg_namespace n ON t.relnamespace = n.oid
+                    JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY(c.conkey)
+                    WHERE n.nspname = %s
+                      AND t.relname = %s
+                      AND c.contype = 'p'
+                      AND a.attname = 'chunk_id';
+                """, (SCHEMA_NAME, tbl_name))
+                pk_row = cur.fetchone()
+                pk_name = pk_row[0] if pk_row else None
+                pk_col_count = pk_row[1] if pk_row else 0
+                pk_ok = (pk_row is not None and pk_col_count == 1)
 
                 # Check column type & dimension
                 cur.execute("""
@@ -240,6 +258,8 @@ def verify_scale_readiness(scale_tag: str, spec: dict) -> dict:
 
                 rep_ok = (
                     rows_ok and
+                    distinct_ok and
+                    pk_ok and
                     type_ok and
                     dims_ok and
                     storage_ok and
@@ -256,6 +276,10 @@ def verify_scale_readiness(scale_tag: str, spec: dict) -> dict:
                     "rows": actual_rows,
                     "expected_rows": expected_rows,
                     "rows_ok": rows_ok,
+                    "distinct_rows": distinct_rows,
+                    "distinct_ok": distinct_ok,
+                    "primary_key": pk_name,
+                    "pk_ok": pk_ok,
                     "column_type": actual_type,
                     "expected_type": expected_type,
                     "type_ok": type_ok,
@@ -282,7 +306,7 @@ def verify_scale_readiness(scale_tag: str, spec: dict) -> dict:
                     "total_bytes": total_bytes
                 }
 
-            # 3. Check chunk ID parity across the three tables
+            # 3. Check chunk ID parity across the three tables (explicitly bidirectional across all pairs)
             if results["ready"]:
                 t1 = f"chunks_{scale_tag}_fp32_extended"
                 t2 = f"chunks_{scale_tag}_fp32_plain"
@@ -291,9 +315,15 @@ def verify_scale_readiness(scale_tag: str, spec: dict) -> dict:
                     SELECT COUNT(*) FROM (
                         (SELECT chunk_id FROM {schema}.{t1} EXCEPT SELECT chunk_id FROM {schema}.{t2})
                         UNION ALL
+                        (SELECT chunk_id FROM {schema}.{t2} EXCEPT SELECT chunk_id FROM {schema}.{t1})
+                        UNION ALL
                         (SELECT chunk_id FROM {schema}.{t1} EXCEPT SELECT chunk_id FROM {schema}.{t3})
                         UNION ALL
-                        (SELECT chunk_id FROM {schema}.{t2} EXCEPT SELECT chunk_id FROM {schema}.{t1})
+                        (SELECT chunk_id FROM {schema}.{t3} EXCEPT SELECT chunk_id FROM {schema}.{t1})
+                        UNION ALL
+                        (SELECT chunk_id FROM {schema}.{t2} EXCEPT SELECT chunk_id FROM {schema}.{t3})
+                        UNION ALL
+                        (SELECT chunk_id FROM {schema}.{t3} EXCEPT SELECT chunk_id FROM {schema}.{t2})
                     ) diff;
                 """).format(
                     schema=sql.Identifier(SCHEMA_NAME),
@@ -338,6 +368,8 @@ def main():
                 exp_params = v.get("expected_parameters", {"m": EXPECTED_HNSW_M, "ef_construction": EXPECTED_HNSW_EF_CONSTRUCTION})
                 params_status = "OK" if v.get("params_ok") else "MISMATCH"
                 print(f"  - {k}: rows={v.get('rows')} ({'OK' if v.get('rows_ok') else 'MISMATCH'}), "
+                      f"distinct={'OK' if v.get('distinct_ok') else 'DUPLICATES'}, "
+                      f"pk={v.get('primary_key')} ({'OK' if v.get('pk_ok') else 'MISSING'}), "
                       f"type={v.get('column_type')} ({'OK' if v.get('type_ok') else 'MISMATCH'}), "
                       f"storage={v.get('storage_policy')} ({'OK' if v.get('storage_ok') else 'INVALID'}), "
                       f"opclass={v.get('operator_class')} ({'OK' if v.get('opclass_ok') else 'INVALID'}), "
