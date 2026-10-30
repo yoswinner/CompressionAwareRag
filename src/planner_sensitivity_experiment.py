@@ -15,7 +15,7 @@ Key Architectural Guarantees:
      - Phase B: Pure Wall-Clock Latency via parameterized SELECT with time.perf_counter().
        [Precomputed embeddings; warmups; measured passes; never preceded by EXPLAIN ANALYZE; exact K=10 LIMIT].
      - Phase C: Execution Diagnostics via EXPLAIN (ANALYZE, BUFFERS, SETTINGS, FORMAT JSON)
-       [Executed separately after timing passes across all evaluation queries under canonical profile P5].
+       [Executed separately after timing passes across all evaluation queries under canonical profile P4].
   4. Exact Boundary Tie Detection & Recall Evaluation:
      - Auxiliary un-timed query executed outside Phase B latency timing to identify cosine distance (<=>) ties
        at rank K vs K+1 using an exact sequential scan with plan verification.
@@ -23,11 +23,11 @@ Key Architectural Guarantees:
      - Retains tie indicators and computes separate Tie-Aware Recall@10 where boundary distance ties occur.
   5. Optimized Matrix Accounting:
      - Planner-selected mode: timed across all 9 cost profiles.
-     - Forced exact mode: timed once per (scale, rep) under canonical profile (P5).
-     - Forced HNSW mode: timed once per (scale, rep) under canonical profile (P5).
+     - Forced exact mode: timed once per (scale, rep) under canonical profile (P4).
+     - Forced HNSW mode: timed once per (scale, rep) under canonical profile (P4).
      - Full plan curves across all 9 profiles captured via execution-free Phase A EXPLAIN.
      - Total timed executions: 8,100 + 900 + 900 = 9,900 for full matrix (excludes warmups/diagnostics).
-     - Diagnostic executions: 9 combinations x 3 modes x 20 queries = 540 at canonical profile P5.
+     - Diagnostic executions: 9 combinations x 3 modes x 20 queries = 540 at canonical profile P4.
   6. Reproducibility & Seeded Trial Interleaving:
      - Configurable fixed random seed (default 42).
      - Randomized trial sequencing within each measured pass to mitigate systematic ordering effects
@@ -91,14 +91,16 @@ FIXED_SEQ_PAGE_COST = 1.0
 FIXED_CPU_TUPLE_COST = 0.01
 FIXED_EF_SEARCH = 40
 FIXED_LIMIT = 10
-DEFAULT_CANONICAL_FORCED_PROFILE = "P5"
+DEFAULT_CANONICAL_FORCED_PROFILE = "P4"  # P4 is standard PostgreSQL default (seq=1.0, rpc=4.0, cpu_op=0.0025, cpu_tuple=0.01)
 DEFAULT_RANDOM_SEED = 42
 COSINE_DISTANCE_TOLERANCE = 1e-6
+SENSITIVITY_TOLERANCES = [1e-7, 1e-6, 1e-5]
 TOLERANCE_POLICY = (
-    "1.0e-6 (absolute cosine distance threshold |dist - boundary| <= 1e-6). "
-    "Appropriate for IEEE 754 single-precision floating-point dot product and norm "
-    "accumulations across 768 dimensions without conflating distinct semantic vector neighborhoods. "
-    "Represents approximate numerical equivalence within rounding bounds, not mathematically exact real equality."
+    "1.0e-6 operational numerical-equivalence threshold (with robustness checks at 1e-7 and 1e-5). "
+    "Represents approximate numerical equivalence for IEEE 754 single-precision floating-point dot product "
+    "and norm accumulations across 768 dimensions under hardware and compiler vector math, "
+    "rather than a proven floating-point upper bound. "
+    "Serves as an operational policy to handle boundary distance ties without penalizing equivalent candidates."
 )
 
 
@@ -111,6 +113,7 @@ def generate_cartesian_cost_grid(
     """
     Generates the 9-profile Cartesian cost grid:
     random_page_cost in {1.0, 4.0, 8.0} x cpu_operator_cost in {0.0025, 0.010, 0.050}.
+    Cost values represent arbitrary relative optimizer units where 1.0 = cost of 1 sequential page read.
     """
     rpc_list = random_page_costs if random_page_costs is not None else DEFAULT_RANDOM_PAGE_COSTS
     op_list = cpu_operator_costs if cpu_operator_costs is not None else DEFAULT_CPU_OPERATOR_COSTS
@@ -120,13 +123,18 @@ def generate_cartesian_cost_grid(
     for rpc in sorted(rpc_list):
         for op in sorted(op_list):
             prof_name = f"P{idx}"
+            desc = f"rpc={rpc}_op={op}"
+            if prof_name == "P4":
+                desc += " (PostgreSQL Standard Default - Canonical Forced Profile)"
+            elif prof_name == "P5":
+                desc += " (Elevated CPU Operator Cost Sensitivity Setting)"
             profiles[prof_name] = {
                 "profile_id": prof_name,
                 "random_page_cost": float(rpc),
                 "cpu_operator_cost": float(op),
                 "seq_page_cost": float(seq_page_cost),
                 "cpu_tuple_cost": float(cpu_tuple_cost),
-                "description": f"rpc={rpc}_op={op}"
+                "description": desc
             }
             idx += 1
     return profiles
@@ -518,6 +526,8 @@ def calculate_recall_metrics(
 
     if not gt_tie_group or "B_ids" not in gt_tie_group or "T_ids" not in gt_tie_group:
         # Fallback if no tie group provided
+        sens_recalls = {f"{t:.1e}": conventional_recall for t in SENSITIVITY_TOLERANCES}
+        sens_ties = {f"{t:.1e}": False for t in SENSITIVITY_TOLERANCES}
         return {
             "conventional_recall": conventional_recall,
             "tie_aware_recall": conventional_recall,
@@ -531,7 +541,10 @@ def calculate_recall_metrics(
             "credited_T": 0,
             "conventional_hits": conventional_hits,
             "tie_aware_hits": conventional_hits,
-            "tolerance": tolerance
+            "tolerance": tolerance,
+            "sensitivity_recalls": sens_recalls,
+            "sensitivity_ties": sens_ties,
+            "sensitivity_tolerances": [f"{t:.1e}" for t in SENSITIVITY_TOLERANCES]
         }
 
     B = set(gt_tie_group["B_ids"])
@@ -542,6 +555,8 @@ def calculate_recall_metrics(
 
     # If no boundary tie exists and B was not populated, tie-aware recall simplifies exactly to conventional Recall@K
     if not has_boundary_tie and not gt_tie_group.get("has_tie", False) and len(B) == 0:
+        sens_recalls = {f"{t:.1e}": conventional_recall for t in SENSITIVITY_TOLERANCES}
+        sens_ties = {f"{t:.1e}": False for t in SENSITIVITY_TOLERANCES}
         return {
             "conventional_recall": conventional_recall,
             "tie_aware_recall": conventional_recall,
@@ -556,7 +571,10 @@ def calculate_recall_metrics(
             "delta": gt_tie_group.get("delta") if gt_tie_group else None,
             "conventional_hits": conventional_hits,
             "tie_aware_hits": conventional_hits,
-            "tolerance": tolerance
+            "tolerance": tolerance,
+            "sensitivity_recalls": sens_recalls,
+            "sensitivity_ties": sens_ties,
+            "sensitivity_tolerances": [f"{t:.1e}" for t in SENSITIVITY_TOLERANCES]
         }
 
     # Disjoint intersections
@@ -565,6 +583,26 @@ def calculate_recall_metrics(
     credited_T = min(hits_T, r)
     tie_aware_hits = hits_B + credited_T
     tie_aware_recall = min(1.0, tie_aware_hits / float(top_k))
+
+    # Tolerance sensitivity analysis across predefined robustness thresholds (e.g. 1e-7, 1e-6, 1e-5)
+    sensitivity_recalls = {}
+    sensitivity_ties = {}
+    sens_data = gt_tie_group.get("sensitivity_results", {})
+    if sens_data:
+        for tol_k, s_info in sens_data.items():
+            b_set = set(s_info.get("B_ids", []))
+            t_set = set(s_info.get("T_ids", []))
+            r_sl = s_info.get("available_tie_slots", max(0, top_k - len(b_set)))
+            h_b = len(S.intersection(b_set))
+            h_t = len(S.intersection(t_set))
+            c_t = min(h_t, r_sl)
+            sensitivity_recalls[tol_k] = min(1.0, (h_b + c_t) / float(top_k))
+            sensitivity_ties[tol_k] = bool(s_info.get("has_boundary_tie", len(t_set) > r_sl))
+    else:
+        for tol_v in SENSITIVITY_TOLERANCES:
+            tol_k = f"{tol_v:.1e}"
+            sensitivity_recalls[tol_k] = tie_aware_recall
+            sensitivity_ties[tol_k] = has_boundary_tie
 
     return {
         "conventional_recall": conventional_recall,
@@ -580,7 +618,10 @@ def calculate_recall_metrics(
         "delta": gt_tie_group.get("delta") if gt_tie_group else None,
         "conventional_hits": conventional_hits,
         "tie_aware_hits": tie_aware_hits,
-        "tolerance": tolerance
+        "tolerance": tolerance,
+        "sensitivity_recalls": sensitivity_recalls,
+        "sensitivity_ties": sensitivity_ties,
+        "sensitivity_tolerances": [f"{t:.1e}" for t in SENSITIVITY_TOLERANCES]
     }
 
 
@@ -653,18 +694,39 @@ def retrieve_boundary_tie_group(
                         "size_T": 0,
                         "available_tie_slots": top_k,
                         "has_boundary_tie": False,
+                        "has_tie": False,
+                        "delta": None,
                         "B_ids": set(),
                         "T_ids": set(),
                         "B_ids_list": [],
                         "T_ids_list": [],
+                        "sensitivity_results": {},
                         "scan_node_type": "Seq Scan"
                     }
-                if isinstance(b_row[0], (dict, list)):
-                    D = 0.50  # mock fallback
-                elif len(b_row) > 1:
-                    D = float(b_row[1])
-                else:
-                    D = float(b_row[0])
+
+                # Rigorous validation replacing any mock fallback
+                if not isinstance(b_row, (tuple, list)) or len(b_row) < 2:
+                    raise ValueError(
+                        f"Boundary query on '{schema_name}.{table_name}' returned malformed row structure: "
+                        f"expected (chunk_id, numeric distance), got {b_row!r}."
+                    )
+                chunk_id_val, dist_val = b_row[0], b_row[1]
+                if isinstance(chunk_id_val, (dict, list)) or isinstance(dist_val, (dict, list)):
+                    raise ValueError(
+                        f"Boundary query on '{schema_name}.{table_name}' returned unexpected container types: "
+                        f"chunk_id={chunk_id_val!r}, distance={dist_val!r}. Dicts/lists are not valid row data."
+                    )
+                try:
+                    D = float(dist_val)
+                except (TypeError, ValueError) as e:
+                    raise ValueError(
+                        f"Boundary query on '{schema_name}.{table_name}' returned non-numeric distance: {dist_val!r}."
+                    ) from e
+
+                if not math.isfinite(D):
+                    raise ValueError(
+                        f"Boundary query on '{schema_name}.{table_name}' returned non-finite distance: {D}."
+                    )
 
             # 2. Plan capture and verification for the tie query
             explain_sql = sql.SQL("""
@@ -688,7 +750,8 @@ def retrieve_boundary_tie_group(
                     f"The auxiliary boundary tie detection must use an exact sequential scan."
                 )
 
-            # 3. Retrieve all corpus rows up to D + tolerance
+            # 3. Retrieve all corpus rows up to D + max(SENSITIVITY_TOLERANCES)
+            max_tol = max(SENSITIVITY_TOLERANCES) if SENSITIVITY_TOLERANCES else tolerance
             group_sql = sql.SQL("""
                 SELECT chunk_id, (embedding <=> %s::vector(768)) AS distance
                 FROM {schema}.{table}
@@ -698,21 +761,42 @@ def retrieve_boundary_tie_group(
                 schema=sql.Identifier(schema_name),
                 table=sql.Identifier(table_name)
             )
-            cur.execute(group_sql, (query_vector, query_vector, D + tolerance))
+            cur.execute(group_sql, (query_vector, query_vector, D + max_tol))
             rows = cur.fetchall()
 
-            B_ids = set()
-            T_ids = set()
+            items_with_distance = []
             for r in rows:
-                c_id = r[0]
-                dist = float(r[1])
-                if dist < (D - tolerance):
-                    B_ids.add(c_id)
-                elif abs(dist - D) <= tolerance:
-                    T_ids.add(c_id)
+                if isinstance(r, (tuple, list)) and len(r) >= 2:
+                    try:
+                        d_f = float(r[1])
+                        if math.isfinite(d_f):
+                            items_with_distance.append((r[0], d_f))
+                    except (TypeError, ValueError):
+                        pass
+
+            B_ids = {cid for cid, dist in items_with_distance if dist < (D - tolerance)}
+            T_ids = {cid for cid, dist in items_with_distance if abs(dist - D) <= tolerance}
 
             r_slots = max(0, top_k - len(B_ids))
             has_boundary_tie = len(T_ids) > r_slots
+
+            # Robustness sensitivity analysis across tolerances (e.g. 1e-7, 1e-6, 1e-5)
+            sensitivity_results = {}
+            for tol_val in (SENSITIVITY_TOLERANCES or [tolerance]):
+                b_set = {cid for cid, dist in items_with_distance if dist < (D - tol_val)}
+                t_set = {cid for cid, dist in items_with_distance if abs(dist - D) <= tol_val}
+                r_sl = max(0, top_k - len(b_set))
+                has_tie_tol = len(t_set) > r_sl
+                tol_key = f"{tol_val:.1e}"
+                sensitivity_results[tol_key] = {
+                    "tolerance": tol_val,
+                    "has_boundary_tie": has_tie_tol,
+                    "size_B": len(b_set),
+                    "size_T": len(t_set),
+                    "available_tie_slots": r_sl,
+                    "B_ids": b_set,
+                    "T_ids": t_set
+                }
 
             return {
                 "boundary_distance": D,
@@ -727,6 +811,7 @@ def retrieve_boundary_tie_group(
                 "T_ids": T_ids,
                 "B_ids_list": sorted(list(B_ids)),
                 "T_ids_list": sorted(list(T_ids)),
+                "sensitivity_results": sensitivity_results,
                 "scan_node_type": scan_type
             }
         finally:
@@ -820,7 +905,9 @@ def check_boundary_distance_tie(
                 has_tie = False
 
             # Construct complete tie group and strictly better set B
+            sensitivity_results = {}
             if r10_dist is not None:
+                max_tol = max(SENSITIVITY_TOLERANCES) if SENSITIVITY_TOLERANCES else tolerance
                 group_sql = sql.SQL("""
                     SELECT chunk_id, (embedding <=> %s::{cast}) AS distance
                     FROM {schema}.{table}
@@ -831,11 +918,37 @@ def check_boundary_distance_tie(
                     schema=sql.Identifier(schema_name),
                     table=sql.Identifier(table_name)
                 )
-                cur.execute(group_sql, (query_vector, query_vector, r10_dist + tolerance))
+                cur.execute(group_sql, (query_vector, query_vector, r10_dist + max_tol))
                 group_rows = cur.fetchall()
-                B_ids = {r[0] for r in group_rows if float(r[1]) < (r10_dist - tolerance)}
-                T_ids = {r[0] for r in group_rows if abs(float(r[1]) - r10_dist) <= tolerance}
+                items_with_distance = []
+                for r in group_rows:
+                    if isinstance(r, (tuple, list)) and len(r) >= 2:
+                        try:
+                            d_f = float(r[1])
+                            if math.isfinite(d_f):
+                                items_with_distance.append((r[0], d_f))
+                        except (TypeError, ValueError):
+                            pass
+
+                B_ids = {cid for cid, dist in items_with_distance if dist < (r10_dist - tolerance)}
+                T_ids = {cid for cid, dist in items_with_distance if abs(dist - r10_dist) <= tolerance}
                 r_slots = max(0, top_k - len(B_ids))
+
+                for tol_val in (SENSITIVITY_TOLERANCES or [tolerance]):
+                    b_set = {cid for cid, dist in items_with_distance if dist < (r10_dist - tol_val)}
+                    t_set = {cid for cid, dist in items_with_distance if abs(dist - r10_dist) <= tol_val}
+                    r_sl = max(0, top_k - len(b_set))
+                    has_tie_tol = len(t_set) > r_sl
+                    tol_key = f"{tol_val:.1e}"
+                    sensitivity_results[tol_key] = {
+                        "tolerance": tol_val,
+                        "has_boundary_tie": has_tie_tol,
+                        "size_B": len(b_set),
+                        "size_T": len(t_set),
+                        "available_tie_slots": r_sl,
+                        "B_ids": b_set,
+                        "T_ids": t_set
+                    }
             else:
                 B_ids = set()
                 T_ids = {r10_id} if r10_id is not None else set()
@@ -855,6 +968,7 @@ def check_boundary_distance_tie(
                 "available_tie_slots": r_slots,
                 "B_ids": B_ids,
                 "T_ids": T_ids,
+                "sensitivity_results": sensitivity_results,
                 "scan_node_type": scan_type
             }
         finally:
@@ -1246,14 +1360,13 @@ def run_planner_sensitivity_benchmark(
                 )
                 ground_truths[q_idx] = gt_rows[:top_k]
 
-                # Check if there is an exact boundary tie on the FP32 ground truth table
-                gt_tie_res = check_boundary_distance_tie(
-                    conn, q_vec, SCHEMA_NAME, fp32_ext_tbl, "vector(768)",
-                    profile_params=canonical_prof_params, mode="exact", top_k=top_k
+                # Retrieve complete boundary tie group using exact Seq Scan
+                gt_tie_res = retrieve_boundary_tie_group(
+                    conn, q_vec, SCHEMA_NAME, fp32_ext_tbl, top_k=top_k, tolerance=COSINE_DISTANCE_TOLERANCE
                 )
                 ground_truth_ties[q_idx] = gt_tie_res
-                if gt_tie_res["has_tie"]:
-                    print(f"  [BOUNDARY TIE DETECTED] Query {q_idx}: Rank 10 dist={gt_tie_res['rank_10_distance']:.6f}, Rank 11 dist={gt_tie_res['rank_11_distance']:.6f}")
+                if gt_tie_res.get("has_boundary_tie") or gt_tie_res.get("has_tie"):
+                    print(f"  [BOUNDARY TIE DETECTED] Query {q_idx}: Rank 10 dist={gt_tie_res['boundary_distance']:.6f}, |B|={gt_tie_res['size_B']}, |T|={gt_tie_res['size_T']}")
 
             # 4. Phase A: Execution-Free Plan Captures (All representations, profiles, modes, queries)
             print("\n--- Phase A: Execution-Free Plan Capture ---")
@@ -1633,7 +1746,8 @@ def run_planner_sensitivity_benchmark(
         "modes_evaluated": target_modes,
         "top_k": top_k,
         "numerical_tolerance_policy": {
-            "cosine_distance_tolerance": COSINE_DISTANCE_TOLERANCE,
+            "primary_tolerance": COSINE_DISTANCE_TOLERANCE,
+            "sensitivity_tolerances": SENSITIVITY_TOLERANCES,
             "description": TOLERANCE_POLICY
         },
         "workload_specification": workload_spec,
@@ -1678,7 +1792,7 @@ def main():
     parser.add_argument("--profiles", nargs="+", default=None,
                         help="Specific profile IDs to test (e.g. P1 P5 P9). Default is all 9.")
     parser.add_argument("--canonical-profile", default=DEFAULT_CANONICAL_FORCED_PROFILE,
-                        help="Canonical profile for forced-path timing (default: P5).")
+                        help="Canonical profile for forced-path timing (default: P4).")
     parser.add_argument("--random-seed", type=int, default=DEFAULT_RANDOM_SEED,
                         help="Random seed for deterministic trial presentation (default: 42).")
     parser.add_argument("--pilot", action="store_true", default=False,

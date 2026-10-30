@@ -1,7 +1,7 @@
 # Precision-Aware Query Planning for Vector Retrieval in PostgreSQL
 ## Experimental and Reproducibility Protocol
 
-**Document Version:** 1.4.0  
+**Document Version:** 1.5.0  
 **Target Venue:** IEEE International Conference on Data Engineering (ICDE) / IEEE Transactions on Knowledge and Data Engineering (TKDE)  
 **Workspace:** `CompressionAwareRag`  
 **Repository Branch:** `research/planner-sensitivity`  
@@ -49,22 +49,44 @@ planner_sensitivity
  └── chunks_{scale}_fp16_extended  (halfvec(768), STORAGE EXTENDED)
 ```
 
+#### Coordinate Payload Bytes versus Complete Datum Bytes:
+- **FP32 (`vector(768)`):**
+  - Raw coordinate payload: $768 \times 4 \text{ bytes} = 3{,}072 \text{ bytes}$.
+  - Datum structure with pgvector header: $3{,}072 + 8 \text{ bytes} = 3{,}080 \text{ bytes}$ (under documented $4d + 8$ formula).
+  - Empirically measured storage footprint (`pg_column_size`): $3{,}076 \text{ bytes}$ (reflecting a 4-byte varlena header).
+  - Out-of-line TOAST threshold: Exceeds the ~2 KiB `TOAST_TUPLE_THRESHOLD` on standard 8 KiB PostgreSQL pages.
+- **FP16 (`halfvec(768)`):**
+  - Raw coordinate payload: $768 \times 2 \text{ bytes} = 1{,}536 \text{ bytes}$.
+  - Datum structure with pgvector header: $1{,}536 + 8 \text{ bytes} = 1{,}544 \text{ bytes}$ (under documented $2d + 8$ formula).
+  - Empirically measured storage footprint (`pg_column_size`): $1{,}544 \text{ bytes}$.
+  - Inline heap storage: Sits comfortably below the 2 KiB threshold, remaining 100% inline within main heap blocks.
+
 #### Scientific Interpretation of Representation Contrasts:
 
-1. **`FP32-EXTENDED` vs. `FP32-PLAIN` (Storage-Policy & Heap/TOAST Contrast):**
-   - **Mechanism:** In `FP32-EXTENDED`, 3,076-byte `vector(768)` attributes exceed PostgreSQL's tuple threshold and are automatically moved out-of-line into external TOAST tables. The main heap relation contains only lightweight pointer tuples ($relpages \approx 32\text{--}64$ for $N=5{,}000$). In `FP32-PLAIN`, `ALTER TABLE ... ALTER COLUMN embedding SET STORAGE PLAIN` is applied *before* row ingestion, strictly forbidding out-of-line storage and forcing vectors directly into heap blocks (fitting exactly two tuples per 8 KiB page, expanding $relpages \approx 1{,}500\text{--}3{,}000$ for $N=5{,}000$).
-   - **Isolation:** This pair isolates the pure cost-model and physical-layout effects of TOAST table dereferencing versus inline heap scanning *without* introducing vector quantization or precision loss.
-   - **TOAST Accounting:** Allocated TOAST relation size (`pg_relation_size(reltoastrelid)`) reflects page-allocated extents (in 8 KiB increments) including chunk-header overhead and fragmentation, whereas vector payload equals $N \times 3{,}076$ bytes.
+1. **`FP32-EXTENDED` vs. `FP32-PLAIN` (Storage-Policy & Physical-Layout Contrast):**
+   - **Mechanism:** In `FP32-EXTENDED`, attributes are stored out-of-line in secondary TOAST relations, leaving lightweight pointer tuples in heap blocks ($relpages \approx 32\text{--}64$ at $N=5{,}000$). In `FP32-PLAIN`, `ALTER TABLE ... SET STORAGE PLAIN` is applied *before* row population, forcing vectors directly into heap blocks (fitting exactly two tuples per 8 KiB page, expanding $relpages \approx 1{,}500\text{--}3{,}000$ at $N=5{,}000$).
+   - **Methodological Caution:** This pair compares physical tuple layout and TOAST pointer dereferencing against inline heap storage *without* coordinate quantization. However, physical layout changes also alter page-cache hit patterns and tuple alignment; hence, observed differences reflect combined physical layout consequences rather than an abstract single-variable isolation.
+   - **TOAST Accounting:** Allocated TOAST relation size (`pg_relation_size(reltoastrelid)`) reflects page-allocated extents in 8 KiB increments, chunk headers, and extent allocation boundaries, whereas the uncompressed payload equals $N \times 3{,}076$ bytes.
 
 2. **`FP32-PLAIN` vs. `FP16-EXTENDED` (Inline Density & Quantization Contrast):**
-   - **Mechanism:** Both representations store their vectors inline in heap blocks (`halfvec(768)` is 1,536 bytes, naturally below the 2,048-byte TOAST threshold).
-   - **Isolation:** Comparing `FP32-PLAIN` and `FP16-EXTENDED` isolates the combined effects of:
-     * Datum size (3,076 bytes vs 1,536 bytes per vector).
+   - **Mechanism:** Both representations store embeddings inline in heap blocks (`halfvec(768)` is 1,544 bytes, naturally below the TOAST threshold).
+   - **Combined Variables:** Comparing `FP32-PLAIN` and `FP16-EXTENDED` reflects:
+     * Datum size (3,076 bytes vs 1,544 bytes per vector).
      * Heap tuple density (2 tuples/page vs 4 tuples/page).
-     * Index footprint (e.g., 728 KiB vs 368 KiB at pilot scale; ~40 MB vs ~20 MB at 10k scale).
+     * HNSW index graph size (~40 MB vs ~20 MB at 10k scale).
      * Distance operation implementation (`vector_cosine_ops` vs `halfvec_cosine_ops`).
      * Quantization noise resulting from IEEE 754 16-bit half-precision conversion.
-   - **Attribution Discipline:** Any execution speedup observed in `halfvec` operations stems primarily from reduced memory bus bandwidth, higher buffer cache page density, and reduced index graph size. While modern CPU architectures feature SIMD instruction sets (e.g. AVX2/AVX-512), no claim is made that FP16 speedup is caused by SIMD unless independently isolated via hardware instruction counters.
+   - **Attribution Discipline:** Execution speedup observed in `halfvec` operations stems primarily from reduced memory bus bandwidth, higher buffer cache page density, and reduced index graph size. While modern CPU architectures feature SIMD instruction sets, no claim is made that FP16 speedup is caused by SIMD unless independently isolated via hardware instruction counters.
+
+### 2.3 Atomic Fail-Closed Provisioning Workflow
+Each scale is provisioned within an isolated transaction (`autocommit=False`) with the following strict execution sequence:
+1. **Source Pre-flight**: Verifies source table existence, row count $\ge \text{expected\_count}$, and 768 vector dimensions before any write.
+2. **Target State Pre-flight**: Checks for pre-existing tables/indexes; aborts before writing if partial state exists; skips safely if fully provisioned. Never automatically drops existing objects.
+3. **Table Creation & Storage Policy**: Creates experimental tables; sets `STORAGE PLAIN` on `fp32_plain` prior to inserting any rows.
+4. **Data Population & HNSW Indexing**: Populates exact chunk rows and builds HNSW graph indexes with explicit cosine operator classes (`vector_cosine_ops` / `halfvec_cosine_ops`).
+5. **In-Transaction Integrity Verification**: Asserts exact row counts, 100% chunk ID parity, storage policies, and index validity.
+6. **In-Transaction ANALYZE**: Executes `ANALYZE` explicitly on all three newly created experimental tables *inside* the transaction before commit, ensuring optimizer statistics are populated as part of the atomic commit.
+7. **Atomic Commit**: `conn.commit()` commits the scale only after all preceding operations succeed. If any step fails (including `ANALYZE`), `conn.rollback()` executes, leaving zero orphan or partial tables.
 
 ---
 
@@ -72,40 +94,42 @@ planner_sensitivity
 
 ### 3.1 Planner Cost Parameters
 
-PostgreSQL query planning balances sequential page reads against random page reads and CPU operations:
+PostgreSQL query planning balances sequential page reads against random page reads and CPU operations. Cost values are dimensionless arbitrary relative units (normalized relative to $seq\_page\_cost = 1.0$, which represents the estimated cost of one sequential 8 KiB page fetch):
 
-$$\text{Cost}_{\text{seq}} = \text{pages} \times seq\_page\_cost + \text{tuples} \times cpu\_tuple\_cost + \text{tuples} \times cpu\_operator\_cost$$
+$$\text{Cost}_{\text{seq}} \approx \text{pages} \times seq\_page\_cost + \text{tuples} \times cpu\_tuple\_cost + \text{tuples} \times cpu\_operator\_cost \quad \text{(Conceptual Model)}$$
 
-We vary $random\_page\_cost$ across 3 storage tiers and $cpu\_operator\_cost$ across 3 CPU processing tiers ($3 \times 3 = 9$ profiles):
+We vary $random\_page\_cost \in \{1.0, 4.0, 8.0\}$ and $cpu\_operator\_cost \in \{0.0025, 0.010, 0.050\}$, yielding 9 controlled planner-cost sensitivity settings:
 
-| Profile ID | $random\_page\_cost$ | $cpu\_operator\_cost$ | $seq\_page\_cost$ | $cpu\_tuple\_cost$ | Intended Hardware Analogy |
+| Profile ID | $random\_page\_cost$ | $cpu\_operator\_cost$ | $seq\_page\_cost$ | $cpu\_tuple\_cost$ | Sensitivity Setting / Configuration Description |
 | :--- | :---: | :---: | :---: | :---: | :--- |
-| **P1** | 1.0 | 0.0025 | 1.0 | 0.01 | All-NVMe SSD, fast vectorized CPU (pgvector default $cpu\_operator\_cost$) |
-| **P2** | 1.0 | 0.0100 | 1.0 | 0.01 | Fast NVMe SSD, balanced general-purpose CPU |
-| **P3** | 1.0 | 0.0500 | 1.0 | 0.01 | Fast NVMe SSD, compute-bound / high CPU overhead |
-| **P4** | 4.0 | 0.0025 | 1.0 | 0.01 | Managed cloud disk (gp3 / EBS), fast CPU |
-| **P5** | 4.0 | 0.0100 | 1.0 | 0.01 | **Canonical Default Baseline** (standard PostgreSQL defaults) |
-| **P6** | 4.0 | 0.0500 | 1.0 | 0.01 | Managed cloud disk, compute-bound / high CPU overhead |
-| **P7** | 8.0 | 0.0025 | 1.0 | 0.01 | Legacy HDD / high-latency remote storage, fast CPU |
-| **P8** | 8.0 | 0.0100 | 1.0 | 0.01 | Legacy HDD, balanced CPU |
-| **P9** | 8.0 | 0.0500 | 1.0 | 0.01 | Legacy HDD, high CPU overhead |
+| **P1** | 1.0 | 0.0025 | 1.0 | 0.01 | Low random I/O cost setting, pgvector default operator cost (Pilot Forced Profile) |
+| **P2** | 1.0 | 0.0100 | 1.0 | 0.01 | Low random I/O cost setting, elevated CPU operator cost |
+| **P3** | 1.0 | 0.0500 | 1.0 | 0.01 | Low random I/O cost setting, high CPU operator cost |
+| **P4** | 4.0 | 0.0025 | 1.0 | 0.01 | **Canonical Forced Baseline** (PostgreSQL 18 default settings: $rpc=4.0, op=0.0025$) |
+| **P5** | 4.0 | 0.0100 | 1.0 | 0.01 | Standard random I/O cost setting, elevated CPU operator cost sensitivity setting |
+| **P6** | 4.0 | 0.0500 | 1.0 | 0.01 | Standard random I/O cost setting, high CPU operator cost sensitivity setting |
+| **P7** | 8.0 | 0.0025 | 1.0 | 0.01 | High random I/O cost setting, pgvector default operator cost |
+| **P8** | 8.0 | 0.0100 | 1.0 | 0.01 | High random I/O cost setting, elevated CPU operator cost |
+| **P9** | 8.0 | 0.0500 | 1.0 | 0.01 | High random I/O cost setting, high CPU operator cost |
 
-*Invariant GUCs:* `hnsw.ef_search = 40`, `max_parallel_workers_per_gather = 0`, `LIMIT = 10`.
+*Invariant Settings:* `hnsw.ef_search = 40`, `max_parallel_workers_per_gather = 0`, `LIMIT = 10`.
+
+*Methodological Note:* Cost profiles represent controlled planner-cost sensitivity settings, **not** hardware simulations. Claims mapping cost profiles to specific hardware storage tiers (e.g. NVMe, SSD, EBS, HDD, SAN) are explicitly disclaimed.
 
 ### 3.2 Matrix Optimization Rationale & Workload Accounting
 
-The planner cost settings `random_page_cost` and `cpu_operator_cost` govern query optimizer path cost estimation; they do *not* alter the executor's physical distance calculation once a forced physical plan (Seq Scan or Index Scan) has been chosen.
+The planner cost settings $random\_page\_cost$ and $cpu\_operator\_cost$ govern query optimizer path cost estimation; they do *not* alter the executor's physical distance calculation once a forced physical plan (Seq Scan or Index Scan) has been chosen.
 
 Executing all 3 modes across all 9 profiles for measured trials would require:
 $$3 \text{ scales} \times 3 \text{ reps} \times 9 \text{ profiles} \times 3 \text{ modes} \times 20 \text{ queries} \times 5 \text{ passes} = 24{,}300 \text{ timed queries}$$
 
-We optimize this matrix by designating **Profile P5** ($random\_page\_cost=4.0, cpu\_operator\_cost=0.010$) as the documented **canonical cost profile** for forced-path timing:
+We optimize this matrix by designating **Profile P4** ($random\_page\_cost=4.0, cpu\_operator\_cost=0.0025$, the PostgreSQL standard default baseline) as the documented **canonical cost profile** for forced-path timing (the minimal pilot uses P1):
 
 1. **Planner-Selected Measurements:** Timed across all 9 profiles ($9 \text{ combinations} \times 9 \times 20 \times 5 = \mathbf{8{,}100}$ timed queries).
-2. **Forced Exact Measurements:** Timed once per representation-scale combination under canonical profile P5 ($9 \text{ combinations} \times 1 \times 20 \times 5 = \mathbf{900}$ timed queries).
-3. **Forced HNSW Measurements:** Timed once per representation-scale combination under canonical profile P5 ($9 \text{ combinations} \times 1 \times 20 \times 5 = \mathbf{900}$ timed queries).
+2. **Forced Exact Measurements:** Timed once per representation-scale combination under canonical profile P4 ($9 \text{ combinations} \times 1 \times 20 \times 5 = \mathbf{900}$ timed queries).
+3. **Forced HNSW Measurements:** Timed once per representation-scale combination under canonical profile P4 ($9 \text{ combinations} \times 1 \times 20 \times 5 = \mathbf{900}$ timed queries).
 4. **Planning-Only Plan Captures (Execution-Free):** Query plans are captured across all 9 profiles via `EXPLAIN (SETTINGS, FORMAT JSON)` without executing the queries, providing complete cost curves ($9 \times 3 \text{ modes} \times 9 \text{ profiles} \times 20 \text{ queries} = \mathbf{4{,}860}$ plan captures).
-5. **Diagnostic EXPLAIN ANALYZE Runs:** Captured for all 20 evaluation queries across all 3 modes under canonical profile P5 ($9 \text{ combinations} \times 3 \text{ modes} \times 20 \text{ queries} = \mathbf{540}$ diagnostic runs).
+5. **Diagnostic EXPLAIN ANALYZE Runs:** Captured for all 20 evaluation queries across all 3 modes under canonical profile P4 ($9 \text{ combinations} \times 3 \text{ modes} \times 20 \text{ queries} = \mathbf{540}$ diagnostic runs).
 
 **Total Timed Executions:** $8{,}100 + 900 + 900 = \mathbf{9{,}900}$ (excluding warm-ups and diagnostics).  
 **Total Diagnostic Executions:** $\mathbf{540}$.
@@ -121,7 +145,7 @@ To guarantee microsecond-accurate physical latency while capturing complete plan
 ```mermaid
 flowchart LR
     A["Phase A: Planning-Only EXPLAIN<br/>EXPLAIN (FORMAT JSON, SETTINGS)<br/>(Execution-free plan capture)"] --> B["Phase B: Timed SELECT<br/>Warmups + Measured Passes<br/>(Pure perf_counter timing, exact K=10)"]
-    B --> C["Phase C: Diagnostic Runs<br/>EXPLAIN (ANALYZE, BUFFERS)<br/>(540 runs across all 20 queries at P5)"]
+    B --> C["Phase C: Diagnostic Runs<br/>EXPLAIN (ANALYZE, BUFFERS)<br/>(540 runs across all 20 queries at P4)"]
 ```
 
 ### Phase A: Execution-Free Plan Capture
@@ -136,7 +160,7 @@ flowchart LR
 - **Exact Top-K Limit:** Exactly `top_k = 10` is passed as the SQL parameter, fetching strictly 10 rows.
 - **Precomputation:** Query vectors are precomputed via Ollama embedding model *prior* to starting the benchmark loop and passed as raw parameters.
 - **Timing:** Client-side `time.perf_counter()` bracket immediately surrounding `cur.execute(...)` and `cur.fetchall()`.
-- **Randomized Execution Order:** Within each measured pass, trial execution sequence is randomized using a deterministic configurable random seed (default `42`) to mitigate systematic ordering effects (such as presentation order and sequential cache warming effects). Note that randomization mitigates systematic trial presentation bias across representations and profiles, but does *not* eliminate underlying hardware, OS, or buffer cache effects (which are separately controlled via warmup passes and buffer accounting).
+- **Randomized Execution Order:** Within each measured pass, trial execution sequence is randomized using a deterministic configurable random seed (default `42`) to mitigate systematic presentation order effects.
 
 ### Auxiliary Exact Boundary Tie Detection & Disjoint-Set Recall Formulation
 - **Boundary Detection Procedure (`retrieve_boundary_tie_group`):**
@@ -144,17 +168,18 @@ flowchart LR
   1. Sets `SET LOCAL enable_indexscan = off; SET LOCAL enable_bitmapscan = off; SET LOCAL enable_seqscan = on; SET LOCAL max_parallel_workers_per_gather = 0;`.
   2. Queries the FP32 exact reference table to determine the rank-$K$ boundary distance $D$ (`LIMIT 1 OFFSET top_k - 1`).
   3. Verifies via `EXPLAIN (FORMAT JSON)` that the query plan is strictly `Seq Scan`, failing if an index or approximate path is attempted.
-  4. Retrieves all corpus rows with cosine distance $\le D + \tau$ where $\tau = 1.0 \times 10^{-6}$.
-  5. Constructs mutually disjoint sets of document IDs:
+  4. Retrieves all corpus rows with cosine distance $\le D + \max(\tau_{\text{sens}})$ in a single exact sequential scan pass.
+  5. Validates that the boundary row is a well-formed tuple with numeric, finite distance (rejects mock fallbacks or malformed container objects).
+  6. Constructs mutually disjoint sets of document IDs:
      - $B = \{ c \in \text{Corpus} \mid \text{dist}_{\text{FP32}}(c, q) < D - \tau \}$ (all corpus documents strictly better than boundary).
      - $T = \{ c \in \text{Corpus} \mid |\text{dist}_{\text{FP32}}(c, q) - D| \le \tau \}$ (complete set of documents tied at boundary).
-  6. Calculates available boundary slots: $r = K - |B|$.
-  7. Identifies crossing boundary ties: `has_boundary_tie` = $(|T| > r)$.
+  7. Calculates available boundary slots: $r = \max(0, K - |B|)$.
+  8. Identifies crossing boundary ties: `has_boundary_tie` = $(|T| > r)$.
 
-- **Single Numerical Tolerance Policy ($\tau = 1.0 \times 10^{-6}$):**
-  - Applied uniformly across boundary detection, set construction of $B$ and $T$, recall evaluation, metadata manifests, and unit tests.
-  - *Technical Justification:* Vectors are stored as IEEE 754 single-precision floats (24-bit significand, machine epsilon $\approx 1.19 \times 10^{-7}$). Accumulating dot products and Euclidean norms across 768 dimensions yields floating-point rounding error on the order of $\sqrt{768} \times \epsilon_{\text{fp32}} \approx 3.3 \times 10^{-6}$. A tolerance threshold of $\tau = 1.0 \times 10^{-6}$ is sufficiently wide to absorb float rounding artifacts without conflating distinct semantic vector neighborhoods (which typically exhibit $\Delta \ge 10^{-4}$).
-  - *Philosophical Distinction:* We explicitly classify this threshold as **approximate numerical equivalence within floating-point rounding bounds**, not mathematically exact real equality.
+- **Operational Numerical Equivalence Tolerance ($\tau = 1.0 \times 10^{-6}$):**
+  - **Predeclared Primary Threshold:** $\tau = 1.0 \times 10^{-6}$.
+  - **Justification:** Serves as an operational numerical-equivalence threshold under IEEE 754 single-precision floating-point dot product and norm accumulation across 768 dimensions. It is documented explicitly as an **operational convention** for tie handling, not as a mathematically proven universal error bound.
+  - **Robustness Sensitivity Analysis:** Evaluated across three distinct thresholds: $\tau \in \{1.0 \times 10^{-7}, 1.0 \times 10^{-6}, 1.0 \times 10^{-5}\}$ from the same retrieved FP32 distance values without redundant database scans. Both primary and sensitivity thresholds are recorded in manifest metadata.
 
 - **Dual Recall Formulation:**
   Let $S$ be the candidate top-$K$ document IDs retrieved by any tested mode or representation ($|S| \le K$):
@@ -169,7 +194,7 @@ flowchart LR
 
 ### Phase C: Diagnostic Buffer Inspection & Completeness Accounting
 - **Statement:** `EXPLAIN (ANALYZE, BUFFERS, SETTINGS, FORMAT JSON) SELECT ...;`
-- **Coverage:** Executed across all 20 evaluation queries for all 3 modes under canonical profile P5 (540 total diagnostic executions).
+- **Coverage:** Executed across all 20 evaluation queries for all 3 modes under canonical profile P4 (540 total diagnostic executions).
 - **Sequencing:** Executed strictly *after* Phase B timed SELECT queries have concluded.
 - **Runtime Completeness Accounting:** Tracks `expected`, `attempted`, `successful`, and `failed` executions.
   - Every attempt writes an explicit JSON line to `diagnostic_results.jsonl`, including errors with `error_message`.
@@ -195,16 +220,16 @@ flowchart LR
 # Verify PostgreSQL and pgvector availability
 psql -U postgres -d compression_aware_rag_scale -c "SELECT extversion FROM pg_extension WHERE extname = 'vector';"
 
-# Run full test suite (78 tests)
+# Run full test suite (89+ tests)
 pytest -v
 ```
 
 ### Step 2: Experimental Schema Provisioning & Readiness Verification
 ```bash
-# Provision isolated experimental tables, set STORAGE PLAIN, build HNSW indexes, and analyze
+# Provision isolated experimental tables with atomic transaction-per-scale guarantees
 python scripts/provision_planner_sensitivity.py --scale 1001 --scale 5000 --scale 10000 --apply
 
-# Perform strictly read-only pre-flight inspection of table readiness, row counts, and indexes
+# Perform strictly read-only pre-flight inspection of table readiness, row counts, types, opclasses, and indexes
 python scripts/verify_table_readiness.py --scale all
 ```
 
@@ -216,5 +241,6 @@ python src/planner_sensitivity_experiment.py --pilot
 
 ### Step 4: Full Multi-Profile Research Execution (9,900 Timed Queries, 540 Diagnostics)
 ```bash
-python src/planner_sensitivity_experiment.py --scale all --representation all --canonical-profile P5 --passes 5 --warmup 2
+# Full execution across all scales and profiles under canonical profile P4
+python src/planner_sensitivity_experiment.py --scale all --representation all --canonical-profile P4 --passes 5 --warmup 2
 ```

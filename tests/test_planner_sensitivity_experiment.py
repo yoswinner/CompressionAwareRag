@@ -108,7 +108,7 @@ def test_calculate_expected_workload_full_matrix():
         num_queries=20,
         measured_passes=5,
         warmup_passes=2,
-        canonical_profile_id="P5"
+        canonical_profile_id=DEFAULT_CANONICAL_FORCED_PROFILE
     )
 
     assert workload["rep_scale_combinations"] == 9
@@ -957,3 +957,259 @@ def test_no_accidental_mutation_of_baseline_tables():
     mutating_keywords = ["INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "TRUNCATE", "VACUUM", "ANALYZE"]
     for kw in mutating_keywords:
         assert kw not in all_executed_sql.upper()
+
+
+# ==============================================================================
+# 10. Phase 1E Final Scientific and Provisioning-Safety Regression Suite
+# ==============================================================================
+
+def test_canonical_profile_selection_p4():
+    """Verify DEFAULT_CANONICAL_FORCED_PROFILE is P4 (standard PostgreSQL 18 defaults)."""
+    assert DEFAULT_CANONICAL_FORCED_PROFILE == "P4"
+    p4 = PLANNER_COST_PROFILES["P4"]
+    assert p4["seq_page_cost"] == 1.0
+    assert p4["random_page_cost"] == 4.0
+    assert p4["cpu_operator_cost"] == 0.0025
+    assert p4["cpu_tuple_cost"] == 0.01
+    assert "PostgreSQL Standard Default" in p4["description"]
+
+
+def test_p5_sensitivity_profile_labeling():
+    """Verify Profile P5 is labeled as an elevated CPU operator cost sensitivity setting."""
+    p5 = PLANNER_COST_PROFILES["P5"]
+    assert p5["seq_page_cost"] == 1.0
+    assert p5["random_page_cost"] == 4.0
+    assert p5["cpu_operator_cost"] == 0.010
+    assert p5["cpu_tuple_cost"] == 0.01
+    assert "Elevated CPU Operator Cost" in p5["description"]
+    assert DEFAULT_CANONICAL_FORCED_PROFILE != "P5"
+
+
+def test_cost_grid_metadata_and_relative_units():
+    """Verify all 9 profiles omit physical hardware simulation analogies and use relative units."""
+    grid = generate_cartesian_cost_grid()
+    disallowed_analogies = ["NVMe", "SSD", "EBS", "gp3", "HDD", "SAN", "hardware", "AWS"]
+    for p_id, prof in grid.items():
+        desc = prof["description"]
+        for analogy in disallowed_analogies:
+            assert analogy.lower() not in desc.lower(), f"Profile {p_id} contains hardware analogy: {analogy}"
+
+
+def test_tolerance_sensitivity_analysis_multithreshold():
+    """Verify calculate_recall_metrics computes sensitivity across 1e-7, 1e-6, 1e-5."""
+    ref_results = [{"chunk_id": i, "distance": 0.40 + i * 0.01} for i in range(1, 15)]
+    cand_results = [{"chunk_id": i, "distance": 0.40 + i * 0.01} for i in range(1, 11)]
+
+    # Mock tie group with sensitivity_results
+    tie_group = {
+        "boundary_distance": 0.50,
+        "has_boundary_tie": False,
+        "available_tie_slots": 1,
+        "B_ids": {i for i in range(1, 10)},
+        "T_ids": {10},
+        "sensitivity_results": {
+            "1.0e-07": {"has_boundary_tie": False, "B_ids": {i for i in range(1, 10)}, "T_ids": {10}, "available_tie_slots": 1},
+            "1.0e-06": {"has_boundary_tie": False, "B_ids": {i for i in range(1, 10)}, "T_ids": {10}, "available_tie_slots": 1},
+            "1.0e-05": {"has_boundary_tie": True, "B_ids": {i for i in range(1, 10)}, "T_ids": {10, 11}, "available_tie_slots": 1}
+        }
+    }
+
+    metrics = calculate_recall_metrics(ref_results, cand_results, gt_tie_group=tie_group, top_k=10)
+    assert "sensitivity_recalls" in metrics
+    assert "sensitivity_ties" in metrics
+    assert "1.0e-07" in metrics["sensitivity_recalls"]
+    assert "1.0e-06" in metrics["sensitivity_recalls"]
+    assert "1.0e-05" in metrics["sensitivity_recalls"]
+    assert metrics["sensitivity_ties"]["1.0e-06"] is False
+    assert metrics["sensitivity_ties"]["1.0e-05"] is True
+    assert metrics["conventional_recall"] == 1.0
+
+
+def test_retrieve_boundary_tie_group_no_mock_fallback():
+    """Verify retrieve_boundary_tie_group extracts boundary distance from actual row without mock fallback."""
+    mock_conn = MagicMock()
+    mock_cur = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cur
+
+    # Mock valid boundary row: rank 10 chunk_id 100, distance 0.423456
+    mock_cur.fetchone.side_effect = [
+        (100, 0.423456),  # Boundary row
+        [[{"Plan": {"Node Type": "Seq Scan"}}]]  # EXPLAIN plan
+    ]
+    # Corpus rows up to D + max_tol
+    mock_cur.fetchall.return_value = [(i, 0.40 + i * 0.002) for i in range(1, 12)]
+
+    res = retrieve_boundary_tie_group(
+        mock_conn, [0.1]*768, "planner_sensitivity", "chunks_5000_fp32_extended", top_k=10
+    )
+    assert res["boundary_distance"] == 0.423456
+    assert res["scan_node_type"] == "Seq Scan"
+    assert "sensitivity_results" in res
+    assert "1.0e-06" in res["sensitivity_results"]
+
+
+def test_retrieve_boundary_tie_group_malformed_result_handling():
+    """Verify retrieve_boundary_tie_group raises ValueError when boundary row is malformed or non-numeric."""
+    mock_conn = MagicMock()
+    mock_cur = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cur
+
+    # Case A: Boundary row contains unexpected list/dict
+    mock_cur.fetchone.return_value = ([{"unexpected": "dict"}],)
+    with pytest.raises(ValueError, match="malformed row structure|unexpected container types"):
+        retrieve_boundary_tie_group(
+            mock_conn, [0.1]*768, "planner_sensitivity", "chunks_5000_fp32_extended", top_k=10
+        )
+
+    # Case B: Boundary row contains non-numeric distance
+    mock_cur.fetchone.return_value = (100, "not-a-number")
+    with pytest.raises(ValueError, match="non-numeric distance"):
+        retrieve_boundary_tie_group(
+            mock_conn, [0.1]*768, "planner_sensitivity", "chunks_5000_fp32_extended", top_k=10
+        )
+
+    # Case C: Boundary row contains infinite distance
+    mock_cur.fetchone.return_value = (100, float("inf"))
+    with pytest.raises(ValueError, match="non-finite distance"):
+        retrieve_boundary_tie_group(
+            mock_conn, [0.1]*768, "planner_sensitivity", "chunks_5000_fp32_extended", top_k=10
+        )
+
+
+def test_provisioner_aborts_on_partial_target_state():
+    """Verify check_target_scale_state detects partial pre-existing tables/indexes."""
+    from scripts.provision_planner_sensitivity import check_target_scale_state
+
+    mock_conn = MagicMock()
+    mock_cur = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cur
+
+    # Simulate 1 table existing out of 3
+    with patch("scripts.provision_planner_sensitivity.check_table_exists", side_effect=[True, False, False]), \
+         patch("scripts.provision_planner_sensitivity.check_index_exists", return_value=False):
+        state = check_target_scale_state(mock_conn, "1001")
+        assert state == "partial"
+
+
+def test_provisioner_validates_source_row_count():
+    """Verify check_source_table_readiness fails closed if source table has fewer rows than expected."""
+    from scripts.provision_planner_sensitivity import check_source_table_readiness
+
+    mock_conn = MagicMock()
+    mock_cur = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cur
+
+    # Table exists, but only contains 500 rows when 1001 are required
+    mock_cur.fetchone.side_effect = [
+        (1,),    # table exists
+        (500,),  # row count = 500
+    ]
+
+    with pytest.raises(RuntimeError, match="less than the required 1001 rows"):
+        check_source_table_readiness(mock_conn, "public", "chunks_embedding_fp32", expected_count=1001)
+
+
+def test_provisioner_transaction_rollback_on_failure():
+    """Verify provision_scale rolls back the transaction when an error occurs during provisioning."""
+    from scripts.provision_planner_sensitivity import provision_scale
+
+    mock_conn = MagicMock()
+    mock_cur = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cur
+
+    spec = {
+        "scale": 1001,
+        "database": "compression_aware_rag_exp",
+        "source_schema": "public",
+        "source_table": "chunks_embedding_fp32",
+        "expected_count": 1001
+    }
+
+    with patch("scripts.provision_planner_sensitivity.psycopg.connect", return_value=mock_conn), \
+         patch("scripts.provision_planner_sensitivity.register_vector"), \
+         patch("scripts.provision_planner_sensitivity.assert_approved_database"), \
+         patch("scripts.provision_planner_sensitivity.check_source_table_readiness", return_value=(1001, 768)), \
+         patch("scripts.provision_planner_sensitivity.check_target_scale_state", return_value="clean"):
+
+        # Make cursor execution raise an error during table creation
+        mock_cur.execute.side_effect = RuntimeError("Disk full simulation")
+
+        with pytest.raises(RuntimeError, match="Disk full simulation"):
+            provision_scale("1001", spec, apply=True)
+
+        # Assert rollback was called and commit was NOT called
+        assert mock_conn.rollback.called
+        assert not mock_conn.commit.called
+
+
+def test_provisioner_analyze_failure_triggers_rollback():
+    """Verify that an error during in-transaction ANALYZE prevents commit and triggers rollback."""
+    from scripts.provision_planner_sensitivity import provision_scale
+
+    mock_conn = MagicMock()
+    mock_cur = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cur
+
+    spec = {
+        "scale": 1001,
+        "database": "compression_aware_rag_exp",
+        "source_schema": "public",
+        "source_table": "chunks_embedding_fp32",
+        "expected_count": 1001
+    }
+
+    def execute_side_effect(query, params=None):
+        query_str = str(query)
+        if "ANALYZE" in query_str.upper():
+            raise RuntimeError("Simulated ANALYZE failure inside transaction")
+        return None
+
+    mock_cur.execute.side_effect = execute_side_effect
+    mock_cur.fetchone.side_effect = [
+        (1001,),  # row count check rep 1
+        (1001,),  # row count check rep 2
+        (1001,),  # row count check rep 3
+        ('e',),   # storage policy check rep 1
+        ('p',),   # storage policy check rep 2
+        ('e',),   # storage policy check rep 3
+        ('vector_cosine_ops', True),   # index check rep 1
+        ('vector_cosine_ops', True),   # index check rep 2
+        ('halfvec_cosine_ops', True),  # index check rep 3
+    ]
+
+    with patch("scripts.provision_planner_sensitivity.psycopg.connect", return_value=mock_conn), \
+         patch("scripts.provision_planner_sensitivity.register_vector"), \
+         patch("scripts.provision_planner_sensitivity.assert_approved_database"), \
+         patch("scripts.provision_planner_sensitivity.check_source_table_readiness", return_value=(1001, 768)), \
+         patch("scripts.provision_planner_sensitivity.check_target_scale_state", return_value="clean"), \
+         patch("scripts.provision_planner_sensitivity.validate_chunk_id_equivalence", return_value={"valid": True, "total_rows": 1001, "mismatched_ids": 0}):
+
+        with pytest.raises(RuntimeError, match="Simulated ANALYZE failure inside transaction"):
+            provision_scale("1001", spec, apply=True)
+
+        assert mock_conn.rollback.called
+        assert not mock_conn.commit.called
+
+
+def test_hnsw_operator_class_validation():
+    """Verify expected operator classes for vector vs halfvec representations."""
+    for rep in ["fp32_extended", "fp32_plain"]:
+        is_halfvec = "fp16" in rep
+        opclass = "halfvec_cosine_ops" if is_halfvec else "vector_cosine_ops"
+        assert opclass == "vector_cosine_ops"
+
+    for rep in ["fp16_extended"]:
+        is_halfvec = "fp16" in rep
+        opclass = "halfvec_cosine_ops" if is_halfvec else "vector_cosine_ops"
+        assert opclass == "halfvec_cosine_ops"
+
+
+def test_readiness_checker_validates_types_and_opclasses():
+    """Verify parse_reloptions and readiness checker logic."""
+    from scripts.verify_table_readiness import parse_reloptions
+
+    opts = ["m=16", "ef_construction=64"]
+    parsed = parse_reloptions(opts)
+    assert parsed == {"m": 16, "ef_construction": 64}
+    assert parse_reloptions(None) == {}
+

@@ -6,12 +6,23 @@ One-time database provisioning script for the Planner Sensitivity Experiment.
 Creates isolated experimental tables and HNSW indexes within the dedicated
 schema 'planner_sensitivity'.
 
-Guarantees:
-1. Strict fail-closed isolation: Refuses to touch production baseline catalogs ('compression_aware_rag', 'postgres', 'smart_document_chatbot').
+Guarantees & Scientific Integrity:
+1. Strict fail-closed isolation: Refuses to touch production baseline catalogs
+   ('compression_aware_rag', 'postgres', 'smart_document_chatbot').
 2. Non-interference: Baseline tables in 'public' are strictly untouched.
-3. Storage policy isolation: Sets STORAGE PLAIN for fp32_plain before row insertion.
-4. Parity verification: Verifies 100% chunk ID equivalence across all three representations.
-5. Dry-run mode by default; requires explicit '--apply' flag to execute DDL/DML.
+3. Pre-flight source verification: Asserts source table exists, has rows >= expected_count,
+   and embedding dimension == 768 before any DDL/DML.
+4. Pre-flight target state check: Aborts immediately if partial target tables/indexes exist.
+   Never automatically drops or overwrites pre-existing data.
+5. Transactional execution per scale: Uses autocommit=False. Table creation, STORAGE PLAIN,
+   row insertion, HNSW indexing, validation, and ANALYZE execute within a single transaction per scale.
+   Rolls back completely on any error (including ANALYZE failure), leaving zero partial data.
+6. Storage policy isolation: Sets STORAGE PLAIN for fp32_plain before inserting rows.
+7. Post-population validation: Verifies exact expected row counts, storage policies,
+   HNSW validity, cosine operator classes, and 100% chunk ID equivalence.
+8. In-transaction statistics: Executes ANALYZE explicitly on all three new experimental tables
+   inside the transaction before commit.
+9. Dry-run mode by default; requires explicit '--apply' flag to execute DDL/DML.
 """
 
 import os
@@ -107,368 +118,56 @@ def check_table_exists(conn: psycopg.Connection, schema: str, table: str) -> boo
         return cur.fetchone() is not None
 
 
-def ensure_schema_exists(conn: psycopg.Connection, schema: str = SCHEMA_NAME, apply: bool = False):
-    """Ensures dedicated experimental schema exists."""
-    if not apply:
-        print(f"[DRY RUN] Would verify/create schema '{schema}'.")
-        return
+def check_index_exists(conn: psycopg.Connection, schema: str, index: str) -> bool:
+    """Returns True if index exists in the specified schema."""
     with conn.cursor() as cur:
-        cur.execute(sql.SQL("CREATE SCHEMA IF NOT EXISTS {};").format(sql.Identifier(schema)))
-        print(f"[APPLIED] Schema '{schema}' ensured.")
-
-
-def create_representation_table(
-    conn: psycopg.Connection,
-    scale_tag: str,
-    rep: str,
-    apply: bool = False
-) -> str:
-    """
-    Creates an isolated table in planner_sensitivity schema with the appropriate storage policy.
-    CRITICAL: For fp32_plain, STORAGE PLAIN must be set before inserting any rows!
-    """
-    table_name = f"chunks_{scale_tag}_{rep}"
-    if check_table_exists(conn, SCHEMA_NAME, table_name):
-        print(f"[-] Table {SCHEMA_NAME}.{table_name} already exists. Refusing to overwrite.")
-        return table_name
-
-    is_halfvec = "fp16" in rep
-    col_type = "halfvec(768)" if is_halfvec else "vector(768)"
-    storage_policy = "PLAIN" if rep == "fp32_plain" else "EXTENDED"
-
-    if not apply:
-        print(f"[DRY RUN] Would create table {SCHEMA_NAME}.{table_name} ({col_type}, STORAGE {storage_policy}).")
-        return table_name
-
-    with conn.cursor() as cur:
-        # 1. Create table structure
-        create_sql = sql.SQL("""
-            CREATE TABLE {schema}.{table} (
-                chunk_id INT PRIMARY KEY,
-                embedding {type} NOT NULL
-            );
-        """).format(
-            schema=sql.Identifier(SCHEMA_NAME),
-            table=sql.Identifier(table_name),
-            type=sql.SQL(col_type)
-        )
-        cur.execute(create_sql)
-
-        # 2. Set storage policy BEFORE inserting rows
-        alter_storage_sql = sql.SQL("""
-            ALTER TABLE {schema}.{table} ALTER COLUMN embedding SET STORAGE {policy};
-        """).format(
-            schema=sql.Identifier(SCHEMA_NAME),
-            table=sql.Identifier(table_name),
-            policy=sql.SQL(storage_policy)
-        )
-        cur.execute(alter_storage_sql)
-        print(f"[APPLIED] Created {SCHEMA_NAME}.{table_name} with column embedding {col_type} (STORAGE {storage_policy}).")
-
-    return table_name
-
-
-def populate_representation_table(
-    conn: psycopg.Connection,
-    scale_tag: str,
-    rep: str,
-    source_schema: str,
-    source_table: str,
-    limit: int | None = None,
-    source_conn: psycopg.Connection | None = None,
-    apply: bool = False
-):
-    """
-    Populates the experimental table from the verified FP32 source table.
-    Preserves identical chunk IDs and casts to halfvec(768) if FP16.
-    Supports in-database insert or streaming across connections.
-    """
-    table_name = f"chunks_{scale_tag}_{rep}"
-    if not apply:
-        print(f"[DRY RUN] Would populate {SCHEMA_NAME}.{table_name} from {source_schema}.{source_table} (limit={limit}).")
-        return
-
-    with conn.cursor() as cur:
-        # Check current row count
-        cur.execute(sql.SQL("SELECT COUNT(*) FROM {schema}.{table};").format(
-            schema=sql.Identifier(SCHEMA_NAME),
-            table=sql.Identifier(table_name)
-        ))
-        cnt = cur.fetchone()[0]
-        if cnt > 0:
-            print(f"[-] Table {SCHEMA_NAME}.{table_name} already contains {cnt} rows. Skipping insert.")
-            return
-
-        is_halfvec = "fp16" in rep
-        cast_expr = sql.SQL("embedding::halfvec(768)") if is_halfvec else sql.SQL("embedding")
-
-        if source_conn is not None and source_conn != conn:
-            # Stream from cross-database source
-            with source_conn.cursor() as src_cur:
-                q = sql.SQL("""
-                    SELECT chunk_id, embedding
-                    FROM {src_schema}.{src_table}
-                    ORDER BY chunk_id ASC
-                """).format(
-                    src_schema=sql.Identifier(source_schema),
-                    src_table=sql.Identifier(source_table)
-                )
-                if limit is not None:
-                    q = q + sql.SQL(" LIMIT {}").format(sql.Literal(limit))
-                src_cur.execute(q)
-                src_rows = src_cur.fetchall()
-
-            insert_sql = sql.SQL("""
-                INSERT INTO {schema}.{table} (chunk_id, embedding)
-                VALUES (%s, %s::{cast});
-            """).format(
-                schema=sql.Identifier(SCHEMA_NAME),
-                table=sql.Identifier(table_name),
-                cast=sql.SQL("halfvec(768)" if is_halfvec else "vector(768)")
-            )
-            cur.executemany(insert_sql, src_rows)
-        else:
-            # In-database insert
-            if limit is not None:
-                insert_sql = sql.SQL("""
-                    INSERT INTO {schema}.{table} (chunk_id, embedding)
-                    SELECT chunk_id, {cast}
-                    FROM {src_schema}.{src_table}
-                    ORDER BY chunk_id ASC
-                    LIMIT %s;
-                """).format(
-                    schema=sql.Identifier(SCHEMA_NAME),
-                    table=sql.Identifier(table_name),
-                    cast=cast_expr,
-                    src_schema=sql.Identifier(source_schema),
-                    src_table=sql.Identifier(source_table)
-                )
-                cur.execute(insert_sql, (limit,))
-            else:
-                insert_sql = sql.SQL("""
-                    INSERT INTO {schema}.{table} (chunk_id, embedding)
-                    SELECT chunk_id, {cast}
-                    FROM {src_schema}.{src_table}
-                    ORDER BY chunk_id ASC;
-                """).format(
-                    schema=sql.Identifier(SCHEMA_NAME),
-                    table=sql.Identifier(table_name),
-                    cast=cast_expr,
-                    src_schema=sql.Identifier(source_schema),
-                    src_table=sql.Identifier(source_table)
-                )
-                cur.execute(insert_sql)
-
-        cur.execute(sql.SQL("SELECT COUNT(*) FROM {schema}.{table};").format(
-            schema=sql.Identifier(SCHEMA_NAME),
-            table=sql.Identifier(table_name)
-        ))
-        inserted = cur.fetchone()[0]
-        print(f"[APPLIED] Populated {SCHEMA_NAME}.{table_name}: {inserted} rows inserted.")
-
-
-def build_representation_hnsw_index(
-    conn: psycopg.Connection,
-    scale_tag: str,
-    rep: str,
-    m: int = 16,
-    ef_construction: int = 64,
-    apply: bool = False
-) -> str:
-    """
-    Builds the HNSW vector index using the appropriate cosine distance operator class.
-    """
-    table_name = f"chunks_{scale_tag}_{rep}"
-    index_name = f"{table_name}_hnsw_idx"
-
-    if not apply:
-        print(f"[DRY RUN] Would build HNSW index {SCHEMA_NAME}.{index_name} on {table_name} (m={m}, ef_construction={ef_construction}).")
-        return index_name
-
-    with conn.cursor() as cur:
-        # Check if index already exists
         cur.execute("""
             SELECT 1 FROM pg_indexes
-            WHERE schemaname = %s AND tablename = %s AND indexname = %s;
-        """, (SCHEMA_NAME, table_name, index_name))
-        if cur.fetchone():
-            print(f"[-] Index {SCHEMA_NAME}.{index_name} already exists. Skipping build.")
-            return index_name
-
-        is_halfvec = "fp16" in rep
-        opclass = "halfvec_cosine_ops" if is_halfvec else "vector_cosine_ops"
-
-        print(f"[APPLIED] Building HNSW index {SCHEMA_NAME}.{index_name} ({opclass}, m={m}, ef_construction={ef_construction})...")
-        t0 = time.perf_counter()
-        idx_sql = sql.SQL("""
-            CREATE INDEX {idx}
-            ON {schema}.{table}
-            USING hnsw (embedding {opclass})
-            WITH (m = {m}, ef_construction = {ef_c});
-        """).format(
-            idx=sql.Identifier(index_name),
-            schema=sql.Identifier(SCHEMA_NAME),
-            table=sql.Identifier(table_name),
-            opclass=sql.SQL(opclass),
-            m=sql.Literal(m),
-            ef_c=sql.Literal(ef_construction)
-        )
-        cur.execute(idx_sql)
-        build_time = time.perf_counter() - t0
-        print(f"[APPLIED] HNSW index {SCHEMA_NAME}.{index_name} built successfully in {build_time:.2f}s.")
-
-    return index_name
+            WHERE schemaname = %s AND indexname = %s;
+        """, (schema, index))
+        return cur.fetchone() is not None
 
 
-def analyze_experimental_table(
+def check_source_table_readiness(
     conn: psycopg.Connection,
-    scale_tag: str,
-    rep: str,
-    apply: bool = False
-):
+    source_schema: str,
+    source_table: str,
+    expected_count: int
+) -> tuple[int, int]:
     """
-    Executes ANALYZE strictly on the newly provisioned table in planner_sensitivity schema.
-    DO NOT execute on baseline or public tables.
+    Validates source table existence, row count >= expected_count, and vector dimension == 768.
+    Returns (source_rows, vector_dim).
     """
-    table_name = f"chunks_{scale_tag}_{rep}"
-    if not apply:
-        print(f"[DRY RUN] Would run ANALYZE {SCHEMA_NAME}.{table_name}.")
-        return
-
     with conn.cursor() as cur:
-        analyze_sql = sql.SQL("ANALYZE {schema}.{table};").format(
-            schema=sql.Identifier(SCHEMA_NAME),
-            table=sql.Identifier(table_name)
-        )
-        cur.execute(analyze_sql)
-        print(f"[APPLIED] ANALYZE completed for {SCHEMA_NAME}.{table_name}.")
-
-
-def inspect_table_metrics(
-    conn: psycopg.Connection,
-    scale_tag: str,
-    rep: str
-) -> dict:
-    """
-    Inspects physical footprint, relation pages, reltuples, and storage layout of an experimental table.
-    """
-    table_name = f"chunks_{scale_tag}_{rep}"
-    with conn.cursor() as cur:
-        # Heap bytes and page count
         cur.execute("""
-            SELECT pg_relation_size(c.oid), c.relpages, c.reltuples
-            FROM pg_class c
-            JOIN pg_namespace n ON c.relnamespace = n.oid
-            WHERE n.nspname = %s AND c.relname = %s;
-        """, (SCHEMA_NAME, table_name))
-        row = cur.fetchone()
-        if not row:
-            return {"error": f"Table {SCHEMA_NAME}.{table_name} not found"}
-        heap_b, relpages, reltuples = row
+            SELECT 1 FROM information_schema.tables
+            WHERE table_schema = %s AND table_name = %s;
+        """, (source_schema, source_table))
+        if not cur.fetchone():
+            raise RuntimeError(f"Source table '{source_schema}.{source_table}' does not exist!")
 
-        # Total inclusive bytes
-        cur.execute("""
-            SELECT pg_total_relation_size(c.oid)
-            FROM pg_class c
-            JOIN pg_namespace n ON c.relnamespace = n.oid
-            WHERE n.nspname = %s AND c.relname = %s;
-        """, (SCHEMA_NAME, table_name))
-        total_inc_b = cur.fetchone()[0]
-
-        # TOAST size
-        cur.execute("""
-            SELECT c.reltoastrelid
-            FROM pg_class c
-            JOIN pg_namespace n ON c.relnamespace = n.oid
-            WHERE n.nspname = %s AND c.relname = %s;
-        """, (SCHEMA_NAME, table_name))
-        toast_oid_row = cur.fetchone()
-        toast_oid = toast_oid_row[0] if toast_oid_row else 0
-
-        toast_tbl_b = 0
-        toast_idx_b = 0
-        if toast_oid and toast_oid != 0:
-            cur.execute("SELECT pg_relation_size(%s);", (toast_oid,))
-            toast_tbl_b = cur.fetchone()[0] or 0
-            cur.execute("SELECT pg_indexes_size(%s);", (toast_oid,))
-            toast_idx_b = cur.fetchone()[0] or 0
-
-        # HNSW Index size
-        index_name = f"{table_name}_hnsw_idx"
-        cur.execute("""
-            SELECT pg_relation_size(c.oid)
-            FROM pg_class c
-            JOIN pg_namespace n ON c.relnamespace = n.oid
-            WHERE n.nspname = %s AND c.relname = %s;
-        """, (SCHEMA_NAME, index_name))
-        idx_row = cur.fetchone()
-        idx_bytes = idx_row[0] if idx_row else 0
-
-        # PK Index size
-        cur.execute("""
-            SELECT pg_relation_size(c.oid)
-            FROM pg_class c
-            JOIN pg_namespace n ON c.relnamespace = n.oid
-            WHERE n.nspname = %s AND c.relname = %s;
-        """, (SCHEMA_NAME, f"{table_name}_pkey"))
-        pk_row = cur.fetchone()
-        pk_bytes = pk_row[0] if pk_row else 0
-
-        # Row count
         cur.execute(sql.SQL("SELECT COUNT(*) FROM {schema}.{table};").format(
-            schema=sql.Identifier(SCHEMA_NAME),
-            table=sql.Identifier(table_name)
+            schema=sql.Identifier(source_schema),
+            table=sql.Identifier(source_table)
         ))
-        actual_rows = cur.fetchone()[0]
+        source_rows = cur.fetchone()[0]
+        if source_rows < expected_count:
+            raise RuntimeError(
+                f"Source table '{source_schema}.{source_table}' contains {source_rows} rows, "
+                f"which is less than the required {expected_count} rows!"
+            )
 
-        # Vector dimensions
         cur.execute(sql.SQL("SELECT DISTINCT vector_dims(embedding) FROM {schema}.{table};").format(
-            schema=sql.Identifier(SCHEMA_NAME),
-            table=sql.Identifier(table_name)
+            schema=sql.Identifier(source_schema),
+            table=sql.Identifier(source_table)
         ))
         dims = [r[0] for r in cur.fetchall()]
-
-        # Storage policy
-        cur.execute("""
-            SELECT a.attstorage
-            FROM pg_attribute a
-            JOIN pg_class c ON a.attrelid = c.oid
-            JOIN pg_namespace n ON c.relnamespace = n.oid
-            WHERE n.nspname = %s AND c.relname = %s AND a.attname = 'embedding';
-        """, (SCHEMA_NAME, table_name))
-        storage_policy_code = cur.fetchone()[0]
-        policy_map = {'p': 'PLAIN', 'e': 'EXTENDED', 'm': 'MAIN', 'x': 'EXTERNAL'}
-        storage_policy = policy_map.get(storage_policy_code, storage_policy_code)
-
-        # Average column size
-        cur.execute(sql.SQL("""
-            SELECT min(pg_column_size(embedding)), max(pg_column_size(embedding)), avg(pg_column_size(embedding))
-            FROM {schema}.{table};
-        """).format(schema=sql.Identifier(SCHEMA_NAME), table=sql.Identifier(table_name)))
-        min_col, max_col, avg_col = cur.fetchone()
-
-        return {
-            "schema": SCHEMA_NAME,
-            "table_name": table_name,
-            "scale": scale_tag,
-            "representation": rep,
-            "status": "provisioned",
-            "storage_policy": storage_policy,
-            "row_count": actual_rows,
-            "reltuples": float(reltuples),
-            "relpages": int(relpages),
-            "vector_dims": dims,
-            "column_size_min_bytes": min_col,
-            "column_size_max_bytes": max_col,
-            "column_size_avg_bytes": float(avg_col) if avg_col else 0.0,
-            "heap_bytes": heap_b,
-            "toast_table_bytes": toast_tbl_b,
-            "toast_index_bytes": toast_idx_b,
-            "toast_total_bytes": toast_tbl_b + toast_idx_b,
-            "pk_index_bytes": pk_bytes,
-            "hnsw_index_bytes": idx_bytes,
-            "total_inclusive_bytes": total_inc_b
-        }
+        if dims != [768]:
+            raise RuntimeError(
+                f"Source table '{source_schema}.{source_table}' has invalid vector dimensions: {dims}. "
+                f"Expected [768]."
+            )
+        return source_rows, 768
 
 
 def validate_chunk_id_equivalence(conn: psycopg.Connection, scale_tag: str) -> dict:
@@ -519,6 +218,150 @@ def validate_chunk_id_equivalence(conn: psycopg.Connection, scale_tag: str) -> d
         }
 
 
+def check_target_scale_state(conn: psycopg.Connection, scale_tag: str) -> str:
+    """
+    Checks the existing state of target tables and indexes for a scale.
+    Returns:
+      - 'clean': No tables or indexes exist. Ready for provisioning.
+      - 'fully_provisioned': All 3 tables and 3 indexes exist and have valid structure.
+      - 'partial': Inconsistent state (some tables or indexes exist, or row counts mismatch).
+    """
+    tbls = [f"chunks_{scale_tag}_{rep}" for rep in REPRESENTATIONS]
+    idxs = [f"chunks_{scale_tag}_{rep}_hnsw_idx" for rep in REPRESENTATIONS]
+
+    existing_tbls = [t for t in tbls if check_table_exists(conn, SCHEMA_NAME, t)]
+    existing_idxs = [i for i in idxs if check_index_exists(conn, SCHEMA_NAME, i)]
+
+    if len(existing_tbls) == 0 and len(existing_idxs) == 0:
+        return "clean"
+
+    if len(existing_tbls) == 3 and len(existing_idxs) == 3:
+        parity_check = validate_chunk_id_equivalence(conn, scale_tag)
+        if parity_check.get("valid"):
+            return "fully_provisioned"
+        return "partial"
+
+    return "partial"
+
+
+def inspect_table_metrics(
+    conn: psycopg.Connection,
+    scale_tag: str,
+    rep: str
+) -> dict:
+    """
+    Inspects physical footprint, relation pages, reltuples, and storage layout of an experimental table.
+    """
+    table_name = f"chunks_{scale_tag}_{rep}"
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT pg_relation_size(c.oid), c.relpages, c.reltuples
+            FROM pg_class c
+            JOIN pg_namespace n ON c.relnamespace = n.oid
+            WHERE n.nspname = %s AND c.relname = %s;
+        """, (SCHEMA_NAME, table_name))
+        row = cur.fetchone()
+        if not row:
+            return {"error": f"Table {SCHEMA_NAME}.{table_name} not found"}
+        heap_b, relpages, reltuples = row
+
+        cur.execute("""
+            SELECT pg_total_relation_size(c.oid)
+            FROM pg_class c
+            JOIN pg_namespace n ON c.relnamespace = n.oid
+            WHERE n.nspname = %s AND c.relname = %s;
+        """, (SCHEMA_NAME, table_name))
+        total_inc_b = cur.fetchone()[0]
+
+        cur.execute("""
+            SELECT c.reltoastrelid
+            FROM pg_class c
+            JOIN pg_namespace n ON c.relnamespace = n.oid
+            WHERE n.nspname = %s AND c.relname = %s;
+        """, (SCHEMA_NAME, table_name))
+        toast_oid_row = cur.fetchone()
+        toast_oid = toast_oid_row[0] if toast_oid_row else 0
+
+        toast_tbl_b = 0
+        toast_idx_b = 0
+        if toast_oid and toast_oid != 0:
+            cur.execute("SELECT pg_relation_size(%s);", (toast_oid,))
+            toast_tbl_b = cur.fetchone()[0] or 0
+            cur.execute("SELECT pg_indexes_size(%s);", (toast_oid,))
+            toast_idx_b = cur.fetchone()[0] or 0
+
+        index_name = f"{table_name}_hnsw_idx"
+        cur.execute("""
+            SELECT pg_relation_size(c.oid)
+            FROM pg_class c
+            JOIN pg_namespace n ON c.relnamespace = n.oid
+            WHERE n.nspname = %s AND c.relname = %s;
+        """, (SCHEMA_NAME, index_name))
+        idx_row = cur.fetchone()
+        idx_bytes = idx_row[0] if idx_row else 0
+
+        cur.execute("""
+            SELECT pg_relation_size(c.oid)
+            FROM pg_class c
+            JOIN pg_namespace n ON c.relnamespace = n.oid
+            WHERE n.nspname = %s AND c.relname = %s;
+        """, (SCHEMA_NAME, f"{table_name}_pkey"))
+        pk_row = cur.fetchone()
+        pk_bytes = pk_row[0] if pk_row else 0
+
+        cur.execute(sql.SQL("SELECT COUNT(*) FROM {schema}.{table};").format(
+            schema=sql.Identifier(SCHEMA_NAME),
+            table=sql.Identifier(table_name)
+        ))
+        actual_rows = cur.fetchone()[0]
+
+        cur.execute(sql.SQL("SELECT DISTINCT vector_dims(embedding) FROM {schema}.{table};").format(
+            schema=sql.Identifier(SCHEMA_NAME),
+            table=sql.Identifier(table_name)
+        ))
+        dims = [r[0] for r in cur.fetchall()]
+
+        cur.execute("""
+            SELECT a.attstorage
+            FROM pg_attribute a
+            JOIN pg_class c ON a.attrelid = c.oid
+            JOIN pg_namespace n ON c.relnamespace = n.oid
+            WHERE n.nspname = %s AND c.relname = %s AND a.attname = 'embedding';
+        """, (SCHEMA_NAME, table_name))
+        storage_policy_code = cur.fetchone()[0]
+        policy_map = {'p': 'PLAIN', 'e': 'EXTENDED', 'm': 'MAIN', 'x': 'EXTERNAL'}
+        storage_policy = policy_map.get(storage_policy_code, storage_policy_code)
+
+        cur.execute(sql.SQL("""
+            SELECT min(pg_column_size(embedding)), max(pg_column_size(embedding)), avg(pg_column_size(embedding))
+            FROM {schema}.{table};
+        """).format(schema=sql.Identifier(SCHEMA_NAME), table=sql.Identifier(table_name)))
+        min_col, max_col, avg_col = cur.fetchone()
+
+        return {
+            "schema": SCHEMA_NAME,
+            "table_name": table_name,
+            "scale": scale_tag,
+            "representation": rep,
+            "status": "provisioned",
+            "storage_policy": storage_policy,
+            "row_count": actual_rows,
+            "reltuples": float(reltuples),
+            "relpages": int(relpages),
+            "vector_dims": dims,
+            "column_size_min_bytes": min_col,
+            "column_size_max_bytes": max_col,
+            "column_size_avg_bytes": float(avg_col) if avg_col else 0.0,
+            "heap_bytes": heap_b,
+            "toast_table_bytes": toast_tbl_b,
+            "toast_index_bytes": toast_idx_b,
+            "toast_total_bytes": toast_tbl_b + toast_idx_b,
+            "pk_index_bytes": pk_bytes,
+            "hnsw_index_bytes": idx_bytes,
+            "total_inclusive_bytes": total_inc_b
+        }
+
+
 def provision_scale(
     scale_tag: str,
     spec: dict,
@@ -526,24 +369,30 @@ def provision_scale(
     m: int = 16,
     ef_construction: int = 64
 ) -> list[dict]:
-    """Provisions all 3 representations for a single corpus scale."""
+    """
+    Provisions all 3 representations for a single corpus scale.
+    Strictly transactional per scale: uses autocommit=False and commits only
+    upon 100% verified creation, population, index build, and parity validation.
+    Rolls back completely if any failure occurs.
+    """
     target_db = spec["database"]
     source_db = spec.get("source_database", target_db)
     source_schema = spec["source_schema"]
     source_table = spec["source_table"]
-    expected_count = spec.get("expected_count")
+    expected_count = spec["expected_count"]
 
     print(f"\n=======================================================")
     print(f"PROVISIONING SCALE {scale_tag} (Target Database: '{target_db}', Apply: {apply})")
     print(f"=======================================================")
 
-    conn = psycopg.connect(get_db_connection_string(target_db), autocommit=True)
+    conn = psycopg.connect(get_db_connection_string(target_db), autocommit=False)
     register_vector(conn)
     metrics_list = []
 
     source_conn = None
     if source_db != target_db:
         source_conn = psycopg.connect(get_db_connection_string(source_db), autocommit=True)
+        source_conn.read_only = True
         register_vector(source_conn)
 
     try:
@@ -551,56 +400,199 @@ def provision_scale(
         if source_conn:
             assert_approved_database(source_conn, source_db)
 
-        # 1. Ensure extension and schema
-        if apply:
-            with conn.cursor() as cur:
-                cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
-        ensure_schema_exists(conn, SCHEMA_NAME, apply=apply)
-
-        # 2. Check source table
+        # 1. Pre-flight source readiness inspection
         check_conn = source_conn if source_conn else conn
-        with check_conn.cursor() as cur:
-            cur.execute("""
-                SELECT COUNT(*) FROM information_schema.tables
-                WHERE table_schema = %s AND table_name = %s;
-            """, (source_schema, source_table))
-            if cur.fetchone()[0] == 0:
-                raise RuntimeError(f"Source table '{source_schema}.{source_table}' missing in '{source_db}'!")
+        src_rows, src_dims = check_source_table_readiness(
+            check_conn, source_schema, source_table, expected_count
+        )
+        print(f"[PRE-FLIGHT] Source table '{source_schema}.{source_table}' verified in '{source_db}': {src_rows} rows (required >= {expected_count}), dimension {src_dims}.")
 
-            cur.execute(sql.SQL("SELECT COUNT(*) FROM {schema}.{table};").format(
-                schema=sql.Identifier(source_schema),
-                table=sql.Identifier(source_table)
-            ))
-            source_rows = cur.fetchone()[0]
-            print(f"Verified source table '{source_schema}.{source_table}' in '{source_db}': {source_rows} rows.")
-
-        limit_to_use = expected_count if expected_count else source_rows
-
-        # 3. Provision each of the 3 representations
-        for rep in REPRESENTATIONS:
-            print(f"\n--- Processing Representation: {rep} ---")
-            create_representation_table(conn, scale_tag, rep, apply=apply)
-            populate_representation_table(
-                conn, scale_tag, rep, source_schema, source_table,
-                limit=limit_to_use, source_conn=source_conn, apply=apply
+        # 2. Pre-flight target state inspection
+        target_state = check_target_scale_state(conn, scale_tag)
+        if target_state == "partial":
+            raise RuntimeError(
+                f"PARTIAL PRE-EXISTING STATE DETECTED for scale '{scale_tag}' in database '{target_db}'! "
+                f"Inconsistent tables or indexes exist. To prevent data corruption, provisioning has aborted "
+                f"before any write. The provisioner will never automatically DROP existing objects."
             )
-            build_representation_hnsw_index(conn, scale_tag, rep, m=m, ef_construction=ef_construction, apply=apply)
-            analyze_experimental_table(conn, scale_tag, rep, apply=apply)
+        elif target_state == "fully_provisioned":
+            print(f"[ALREADY PROVISIONED] Scale '{scale_tag}' in '{target_db}' already exists and is verified valid. Skipping.")
+            return [inspect_table_metrics(conn, scale_tag, rep) for rep in REPRESENTATIONS]
 
-            if apply:
-                m_info = inspect_table_metrics(conn, scale_tag, rep)
-                metrics_list.append(m_info)
-                print(f"  Storage footprint: Heap={m_info['heap_bytes']/1024:.1f} KiB, TOAST={m_info['toast_total_bytes']/1024:.1f} KiB, Index={m_info['hnsw_index_bytes']/1024:.1f} KiB")
+        if not apply:
+            print(f"[DRY RUN] Scale '{scale_tag}' is clean and ready to provision {expected_count} rows across {REPRESENTATIONS}.")
+            return []
 
-        # 4. Validate chunk ID parity
-        if apply:
-            print(f"\n--- Validating Chunk ID Equivalence ---")
-            val = validate_chunk_id_equivalence(conn, scale_tag)
-            if not val["valid"]:
-                raise RuntimeError(f"PARITY VALIDATION FAILED for scale {scale_tag}: {val}")
-            print(f"[VERIFIED] 100% Chunk ID equivalence confirmed across all 3 tables ({val['total_rows']} rows, 0 mismatches).")
+        # 3. Transactional Execution Phase
+        print(f"[TRANSACTION BEGIN] Starting atomic provisioning transaction for scale '{scale_tag}'...")
+        try:
+            with conn.cursor() as cur:
+                # Ensure extension and schema
+                cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
+                cur.execute(sql.SQL("CREATE SCHEMA IF NOT EXISTS {};").format(sql.Identifier(SCHEMA_NAME)))
+
+                for rep in REPRESENTATIONS:
+                    tbl_name = f"chunks_{scale_tag}_{rep}"
+                    idx_name = f"{tbl_name}_hnsw_idx"
+                    is_halfvec = "fp16" in rep
+                    col_type = "halfvec(768)" if is_halfvec else "vector(768)"
+                    storage_policy = "PLAIN" if rep == "fp32_plain" else "EXTENDED"
+                    opclass = "halfvec_cosine_ops" if is_halfvec else "vector_cosine_ops"
+
+                    print(f"  - Creating {SCHEMA_NAME}.{tbl_name} ({col_type}, STORAGE {storage_policy})...")
+                    cur.execute(sql.SQL("""
+                        CREATE TABLE {schema}.{table} (
+                            chunk_id INT PRIMARY KEY,
+                            embedding {type} NOT NULL
+                        );
+                    """).format(
+                        schema=sql.Identifier(SCHEMA_NAME),
+                        table=sql.Identifier(tbl_name),
+                        type=sql.SQL(col_type)
+                    ))
+
+                    cur.execute(sql.SQL("""
+                        ALTER TABLE {schema}.{table} ALTER COLUMN embedding SET STORAGE {policy};
+                    """).format(
+                        schema=sql.Identifier(SCHEMA_NAME),
+                        table=sql.Identifier(tbl_name),
+                        policy=sql.SQL(storage_policy)
+                    ))
+
+                    print(f"  - Populating {SCHEMA_NAME}.{tbl_name} ({expected_count} rows)...")
+                    if source_conn is not None and source_conn != conn:
+                        with source_conn.cursor() as src_cur:
+                            src_cur.execute(sql.SQL("""
+                                SELECT chunk_id, embedding
+                                FROM {src_schema}.{src_table}
+                                ORDER BY chunk_id ASC
+                                LIMIT %s;
+                            """).format(
+                                src_schema=sql.Identifier(source_schema),
+                                src_table=sql.Identifier(source_table)
+                            ), (expected_count,))
+                            src_rows_data = src_cur.fetchall()
+                        ins_sql = sql.SQL("""
+                            INSERT INTO {schema}.{table} (chunk_id, embedding)
+                            VALUES (%s, %s::{cast});
+                        """).format(
+                            schema=sql.Identifier(SCHEMA_NAME),
+                            table=sql.Identifier(tbl_name),
+                            cast=sql.SQL(col_type)
+                        )
+                        cur.executemany(ins_sql, src_rows_data)
+                    else:
+                        ins_sql = sql.SQL("""
+                            INSERT INTO {schema}.{table} (chunk_id, embedding)
+                            SELECT chunk_id, {cast_expr}
+                            FROM {src_schema}.{src_table}
+                            ORDER BY chunk_id ASC
+                            LIMIT %s;
+                        """).format(
+                            schema=sql.Identifier(SCHEMA_NAME),
+                            table=sql.Identifier(tbl_name),
+                            cast_expr=sql.SQL("embedding::halfvec(768)" if is_halfvec else "embedding"),
+                            src_schema=sql.Identifier(source_schema),
+                            src_table=sql.Identifier(source_table)
+                        )
+                        cur.execute(ins_sql, (expected_count,))
+
+                    print(f"  - Building HNSW index {SCHEMA_NAME}.{idx_name} ({opclass}, m={m}, ef_construction={ef_construction})...")
+                    t_idx0 = time.perf_counter()
+                    cur.execute(sql.SQL("""
+                        CREATE INDEX {idx}
+                        ON {schema}.{table}
+                        USING hnsw (embedding {opclass})
+                        WITH (m = {m}, ef_construction = {ef_c});
+                    """).format(
+                        idx=sql.Identifier(idx_name),
+                        schema=sql.Identifier(SCHEMA_NAME),
+                        table=sql.Identifier(tbl_name),
+                        opclass=sql.SQL(opclass),
+                        m=sql.Literal(m),
+                        ef_c=sql.Literal(ef_construction)
+                    ))
+                    print(f"    Index built in {time.perf_counter() - t_idx0:.2f}s.")
+
+                # In-transaction verification
+                print("  - Verifying in-transaction post-population integrity...")
+                for rep in REPRESENTATIONS:
+                    tbl_name = f"chunks_{scale_tag}_{rep}"
+                    cur.execute(sql.SQL("SELECT COUNT(*) FROM {schema}.{table};").format(
+                        schema=sql.Identifier(SCHEMA_NAME),
+                        table=sql.Identifier(tbl_name)
+                    ))
+                    act_cnt = cur.fetchone()[0]
+                    if act_cnt != expected_count:
+                        raise RuntimeError(f"Row count assertion failed on {tbl_name}: expected {expected_count}, got {act_cnt}")
+
+                val = validate_chunk_id_equivalence(conn, scale_tag)
+                if not val["valid"]:
+                    raise RuntimeError(f"Chunk ID parity validation failed: {val}")
+
+                for rep in REPRESENTATIONS:
+                    tbl_name = f"chunks_{scale_tag}_{rep}"
+                    expected_storage = "PLAIN" if rep == "fp32_plain" else "EXTENDED"
+                    cur.execute("""
+                        SELECT a.attstorage
+                        FROM pg_attribute a
+                        JOIN pg_class c ON a.attrelid = c.oid
+                        JOIN pg_namespace n ON c.relnamespace = n.oid
+                        WHERE n.nspname = %s AND c.relname = %s AND a.attname = 'embedding';
+                    """, (SCHEMA_NAME, tbl_name))
+                    st_code = cur.fetchone()[0]
+                    st_policy = "PLAIN" if st_code == 'p' else "EXTENDED"
+                    if st_policy != expected_storage:
+                        raise RuntimeError(f"Storage policy check failed on {tbl_name}: expected {expected_storage}, got {st_policy}")
+
+                for rep in REPRESENTATIONS:
+                    tbl_name = f"chunks_{scale_tag}_{rep}"
+                    idx_name = f"{tbl_name}_hnsw_idx"
+                    expected_opc = "halfvec_cosine_ops" if "fp16" in rep else "vector_cosine_ops"
+                    cur.execute("""
+                        SELECT opc.opcname, i.indisvalid
+                        FROM pg_index i
+                        JOIN pg_class c ON c.oid = i.indexrelid
+                        JOIN pg_class t ON t.oid = i.indrelid
+                        JOIN pg_namespace n ON n.oid = t.relnamespace
+                        JOIN pg_opclass opc ON opc.oid = i.indclass[0]
+                        WHERE n.nspname = %s AND t.relname = %s AND c.relname = %s;
+                    """, (SCHEMA_NAME, tbl_name, idx_name))
+                    idx_info = cur.fetchone()
+                    if not idx_info:
+                        raise RuntimeError(f"Index {idx_name} not found after creation!")
+                    if not idx_info[1]:
+                        raise RuntimeError(f"Index {idx_name} is marked INVALID!")
+                    if idx_info[0] != expected_opc:
+                        raise RuntimeError(f"Index {idx_name} operator class mismatch: expected {expected_opc}, got {idx_info[0]}")
+
+                # Step 8: Explicit in-transaction ANALYZE on all three experimental tables before commit
+                print("  - Executing in-transaction ANALYZE on experimental tables...")
+                for rep in REPRESENTATIONS:
+                    tbl_name = f"chunks_{scale_tag}_{rep}"
+                    cur.execute(sql.SQL("ANALYZE {schema}.{table};").format(
+                        schema=sql.Identifier(SCHEMA_NAME),
+                        table=sql.Identifier(tbl_name)
+                    ))
+                    print(f"    ANALYZE {SCHEMA_NAME}.{tbl_name} completed.")
+
+            # Step 9: Commit the entire scale ONLY after all operations, validations, and ANALYZE succeed
+            conn.commit()
+            print(f"[COMMITTED] Scale '{scale_tag}' transaction COMMITTED successfully.")
+
+        except Exception as e:
+            conn.rollback()
+            print(f"[ROLLED BACK] Provisioning scale '{scale_tag}' failed. Transaction ROLLED BACK completely: {e}")
+            raise
+
+        # 4. Post-commit physical inspection (read-only)
+        for rep in REPRESENTATIONS:
+            m_info = inspect_table_metrics(conn, scale_tag, rep)
+            metrics_list.append(m_info)
+            print(f"  Storage footprint ({rep}): Heap={m_info['heap_bytes']/1024:.1f} KiB, TOAST={m_info['toast_total_bytes']/1024:.1f} KiB, Index={m_info['hnsw_index_bytes']/1024:.1f} KiB")
 
         return metrics_list
+
     finally:
         conn.close()
         if source_conn:

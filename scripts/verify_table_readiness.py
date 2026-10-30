@@ -4,15 +4,19 @@ scripts/verify_table_readiness.py
 
 Independent, strictly read-only pre-flight verification script for the
 Planner Sensitivity Experiment.
-Validates table readiness, column storage policies, HNSW index presence,
-and 100% chunk ID equivalence across all experimental catalogs before running benchmarks.
+Validates table readiness, exact row counts, column types and dimensions,
+storage policies, HNSW index presence, validity, operator classes, index parameters,
+physical storage metadata, and 100% chunk ID equivalence across all experimental catalogs
+before running benchmarks.
 
 Guarantees:
-  1. Strictly read-only: Executes zero DDL/DML; never creates, alters, or drops any object.
+  1. Strictly read-only: Executes zero DDL/DML; sets conn.read_only = True.
   2. Protects production baseline databases from access.
-  3. Verifies STORAGE PLAIN on fp32_plain relations.
-  4. Confirms HNSW index existence and valid status.
-  5. Verifies 100% chunk ID parity across the three representation tables.
+  3. Verifies STORAGE PLAIN on fp32_plain relations and EXTENDED on others.
+  4. Confirms HNSW index existence, valid status (indisvalid), and expected cosine operator class.
+  5. Inspects HNSW index options (m, ef_construction) where available.
+  6. Verifies exact expected row counts and 100% chunk ID parity across the three representations.
+  7. Reports comprehensive storage footprint metadata.
 """
 
 import os
@@ -66,8 +70,26 @@ SCALE_SPECS = {
 REPRESENTATIONS = ["fp32_extended", "fp32_plain", "fp16_extended"]
 
 
+def parse_reloptions(options_list: list[str] | None) -> dict:
+    """Parses pg_class.reloptions list like ['m=16', 'ef_construction=64'] into a dict."""
+    if not options_list:
+        return {}
+    res = {}
+    for opt in options_list:
+        if "=" in opt:
+            k, v = opt.split("=", 1)
+            try:
+                res[k.strip()] = int(v.strip())
+            except ValueError:
+                res[k.strip()] = v.strip()
+    return res
+
+
 def verify_scale_readiness(scale_tag: str, spec: dict) -> dict:
-    """Verifies table presence, row counts, storage policies, and indexes for a corpus scale."""
+    """
+    Verifies table presence, row counts, storage policies, column types,
+    HNSW index operator classes, index parameters, and chunk parity for a scale.
+    """
     target_db = spec["database"]
     if target_db in DISALLOWED_DATABASES:
         raise PermissionError(f"Access to database '{target_db}' is strictly forbidden.")
@@ -88,7 +110,7 @@ def verify_scale_readiness(scale_tag: str, spec: dict) -> dict:
 
     try:
         with conn.cursor() as cur:
-            # 1. Verify schema
+            # 1. Verify schema existence
             cur.execute("""
                 SELECT COUNT(*) FROM information_schema.schemata
                 WHERE schema_name = %s;
@@ -103,6 +125,10 @@ def verify_scale_readiness(scale_tag: str, spec: dict) -> dict:
             for rep in REPRESENTATIONS:
                 tbl_name = f"chunks_{scale_tag}_{rep}"
                 idx_name = f"{tbl_name}_hnsw_idx"
+                is_halfvec = "fp16" in rep
+                expected_type = "halfvec(768)" if is_halfvec else "vector(768)"
+                expected_storage = "PLAIN" if rep == "fp32_plain" else "EXTENDED"
+                expected_opclass = "halfvec_cosine_ops" if is_halfvec else "vector_cosine_ops"
 
                 # Check table exists
                 cur.execute("""
@@ -122,6 +148,26 @@ def verify_scale_readiness(scale_tag: str, spec: dict) -> dict:
                     table=sql.Identifier(tbl_name)
                 ))
                 actual_rows = cur.fetchone()[0]
+                rows_ok = (actual_rows == expected_rows)
+
+                # Check column type & dimension
+                cur.execute("""
+                    SELECT format_type(a.atttypid, a.atttypmod)
+                    FROM pg_attribute a
+                    JOIN pg_class c ON a.attrelid = c.oid
+                    JOIN pg_namespace n ON c.relnamespace = n.oid
+                    WHERE n.nspname = %s AND c.relname = %s AND a.attname = 'embedding';
+                """, (SCHEMA_NAME, tbl_name))
+                col_type_row = cur.fetchone()
+                actual_type = col_type_row[0] if col_type_row else None
+                type_ok = (actual_type == expected_type)
+
+                cur.execute(sql.SQL("SELECT DISTINCT vector_dims(embedding) FROM {schema}.{table};").format(
+                    schema=sql.Identifier(SCHEMA_NAME),
+                    table=sql.Identifier(tbl_name)
+                ))
+                dims = [r[0] for r in cur.fetchall()]
+                dims_ok = (dims == [768])
 
                 # Check storage policy
                 cur.execute("""
@@ -131,24 +177,58 @@ def verify_scale_readiness(scale_tag: str, spec: dict) -> dict:
                 att_row = cur.fetchone()
                 storage_char = att_row[0] if att_row else None
                 storage_type = "PLAIN" if storage_char == "p" else "EXTENDED" if storage_char == "x" else "OTHER"
-
-                expected_storage = "PLAIN" if rep == "fp32_plain" else "EXTENDED"
                 storage_ok = (storage_type == expected_storage)
 
-                # Check HNSW index
+                # Check HNSW index, operator class, and reloptions
                 cur.execute("""
-                    SELECT c.relname, i.indisvalid
+                    SELECT c.relname, i.indisvalid, opc.opcname, am.amname, c.reloptions
                     FROM pg_index i
                     JOIN pg_class c ON c.oid = i.indexrelid
                     JOIN pg_class t ON t.oid = i.indrelid
                     JOIN pg_namespace n ON n.oid = t.relnamespace
+                    JOIN pg_am am ON am.oid = c.relam
+                    JOIN pg_opclass opc ON opc.oid = i.indclass[0]
                     WHERE n.nspname = %s AND t.relname = %s AND c.relname = %s;
                 """, (SCHEMA_NAME, tbl_name, idx_name))
                 idx_row = cur.fetchone()
                 idx_exists = (idx_row is not None)
                 idx_valid = bool(idx_row[1]) if idx_row else False
+                actual_opclass = idx_row[2] if idx_row else None
+                am_name = idx_row[3] if idx_row else None
+                raw_options = idx_row[4] if idx_row else []
+                parsed_opts = parse_reloptions(raw_options)
 
-                rep_ok = (actual_rows == expected_rows and storage_ok and idx_exists and idx_valid)
+                opclass_ok = (actual_opclass == expected_opclass and am_name == "hnsw")
+
+                # Inspect relation storage metadata
+                cur.execute("""
+                    SELECT pg_relation_size(c.oid), pg_total_relation_size(c.oid), c.reltoastrelid
+                    FROM pg_class c
+                    JOIN pg_namespace n ON c.relnamespace = n.oid
+                    WHERE n.nspname = %s AND c.relname = %s;
+                """, (SCHEMA_NAME, tbl_name))
+                size_row = cur.fetchone()
+                heap_bytes = size_row[0] if size_row else 0
+                total_bytes = size_row[1] if size_row else 0
+                toast_oid = size_row[2] if size_row else 0
+
+                toast_bytes = 0
+                if toast_oid and toast_oid != 0:
+                    cur.execute("SELECT pg_total_relation_size(%s);", (toast_oid,))
+                    toast_bytes = cur.fetchone()[0] or 0
+
+                idx_bytes = 0
+                if idx_exists:
+                    cur.execute("""
+                        SELECT pg_relation_size(c.oid)
+                        FROM pg_class c
+                        JOIN pg_namespace n ON c.relnamespace = n.oid
+                        WHERE n.nspname = %s AND c.relname = %s;
+                    """, (SCHEMA_NAME, idx_name))
+                    idx_size_row = cur.fetchone()
+                    idx_bytes = idx_size_row[0] if idx_size_row else 0
+
+                rep_ok = (rows_ok and type_ok and dims_ok and storage_ok and idx_exists and idx_valid and opclass_ok)
                 if not rep_ok:
                     results["ready"] = False
 
@@ -156,12 +236,26 @@ def verify_scale_readiness(scale_tag: str, spec: dict) -> dict:
                     "exists": True,
                     "rows": actual_rows,
                     "expected_rows": expected_rows,
-                    "rows_ok": (actual_rows == expected_rows),
+                    "rows_ok": rows_ok,
+                    "column_type": actual_type,
+                    "expected_type": expected_type,
+                    "type_ok": type_ok,
+                    "dimensions": dims,
+                    "dims_ok": dims_ok,
                     "storage_policy": storage_type,
+                    "expected_storage": expected_storage,
                     "storage_ok": storage_ok,
                     "hnsw_index": idx_name,
                     "index_exists": idx_exists,
-                    "index_valid": idx_valid
+                    "index_valid": idx_valid,
+                    "operator_class": actual_opclass,
+                    "expected_opclass": expected_opclass,
+                    "opclass_ok": opclass_ok,
+                    "index_parameters": parsed_opts,
+                    "heap_bytes": heap_bytes,
+                    "toast_bytes": toast_bytes,
+                    "hnsw_index_bytes": idx_bytes,
+                    "total_bytes": total_bytes
                 }
 
             # 3. Check chunk ID parity across the three tables
@@ -217,7 +311,9 @@ def main():
         for k, v in res["checks"].items():
             if isinstance(v, dict):
                 print(f"  - {k}: rows={v.get('rows')} ({'OK' if v.get('rows_ok') else 'MISMATCH'}), "
+                      f"type={v.get('column_type')} ({'OK' if v.get('type_ok') else 'MISMATCH'}), "
                       f"storage={v.get('storage_policy')} ({'OK' if v.get('storage_ok') else 'INVALID'}), "
+                      f"opclass={v.get('operator_class')} ({'OK' if v.get('opclass_ok') else 'INVALID'}), "
                       f"index={v.get('hnsw_index')} ({'VALID' if v.get('index_valid') else 'MISSING'})")
             else:
                 print(f"  - {k}: {v}")
@@ -226,7 +322,7 @@ def main():
 
     print("\n================================================================================")
     if all_ready:
-        print("[VERIFICATION PASSED] All experimental tables, storage policies, and HNSW indexes are verified ready.")
+        print("[VERIFICATION PASSED] All experimental tables, storage policies, types, opclasses, and HNSW indexes are verified ready.")
         sys.exit(0)
     else:
         print("[VERIFICATION FAILED] One or more experimental scales are missing or misconfigured.")
