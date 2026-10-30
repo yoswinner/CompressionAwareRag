@@ -506,6 +506,11 @@ def provision_scale(
 
     conn = psycopg.connect(get_db_connection_string(target_db), autocommit=False)
     register_vector(conn)
+
+    def on_notice(diag):
+        print(f"    [POSTGRES NOTICE] {diag.message_primary}")
+
+    conn.add_notice_handler(on_notice)
     metrics_list = []
 
     source_conn = None
