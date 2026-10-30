@@ -186,3 +186,7 @@ cython_debug/
 # Generated dataset cache files
 data/raw/msmarco_1k_chunks.*
 data/raw/msmarco_10k_canonical.tsv*
+
+
+# Experimental benchmark and pilot output artifacts
+results/

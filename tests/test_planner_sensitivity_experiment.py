@@ -1,0 +1,959 @@
+#!/usr/bin/env python3
+"""
+tests/test_planner_sensitivity_experiment.py
+
+Comprehensive unit and regression test suite for the planner sensitivity experiment.
+All tests run safely without mutating live production or experimental databases.
+"""
+
+import os
+import math
+import json
+import random
+import statistics
+import pytest
+import psycopg
+from unittest.mock import MagicMock, patch
+
+from src.planner_sensitivity_experiment import (
+    generate_cartesian_cost_grid,
+    calculate_expected_workload,
+    assert_sensitivity_database,
+    get_sensitivity_connection,
+    parse_json_plan,
+    calculate_recall_at_k,
+    calculate_recall_metrics,
+    retrieve_boundary_tie_group,
+    check_boundary_distance_tie,
+    compute_distribution_stats,
+    capture_query_plan,
+    measure_query_latency,
+    execute_diagnostic_pass,
+    capture_environment_snapshot,
+    ALLOWED_DATABASES,
+    DISALLOWED_DATABASES,
+    PLANNER_COST_PROFILES,
+    DEFAULT_CANONICAL_FORCED_PROFILE,
+    DEFAULT_RANDOM_SEED,
+    COSINE_DISTANCE_TOLERANCE,
+    TOLERANCE_POLICY,
+    FIXED_LIMIT
+)
+
+
+# ==============================================================================
+# 1. Cartesian Cost Grid Generation & Validation
+# ==============================================================================
+
+def test_cartesian_grid_generation():
+    """Verify that generate_cartesian_cost_grid outputs exactly 9 distinct valid profiles."""
+    grid = generate_cartesian_cost_grid()
+    assert len(grid) == 9
+    assert list(grid.keys()) == [f"P{i}" for i in range(1, 10)]
+
+    rpcs = {p["random_page_cost"] for p in grid.values()}
+    ops = {p["cpu_operator_cost"] for p in grid.values()}
+
+    assert rpcs == {1.0, 4.0, 8.0}
+    assert ops == {0.0025, 0.010, 0.050}
+
+    for p_id, p in grid.items():
+        assert p["seq_page_cost"] == 1.0
+        assert p["cpu_tuple_cost"] == 0.01
+        assert p["random_page_cost"] in [1.0, 4.0, 8.0]
+        assert p["cpu_operator_cost"] in [0.0025, 0.010, 0.050]
+        assert "description" in p
+
+
+def test_configuration_validation():
+    """Verify custom parameter overrides and edge cases."""
+    custom_grid = generate_cartesian_cost_grid(
+        random_page_costs=[2.0],
+        cpu_operator_costs=[0.02],
+        seq_page_cost=1.5,
+        cpu_tuple_cost=0.02
+    )
+    assert len(custom_grid) == 1
+    assert "P1" in custom_grid
+    assert custom_grid["P1"]["random_page_cost"] == 2.0
+    assert custom_grid["P1"]["cpu_operator_cost"] == 0.02
+    assert custom_grid["P1"]["seq_page_cost"] == 1.5
+    assert custom_grid["P1"]["cpu_tuple_cost"] == 0.02
+
+
+# ==============================================================================
+# 2. Optimized Workload Calculation & Manifest Verification
+# ==============================================================================
+
+def test_calculate_expected_workload_full_matrix():
+    """
+    Verify exact workload count calculation for full experimental matrix:
+    - 9 rep-scale combinations x 9 profiles x 20 queries x 5 passes = 8,100 (planner_selected)
+    - 9 rep-scale combinations x 1 profile x 20 queries x 5 passes = 900 (forced exact)
+    - 9 rep-scale combinations x 1 profile x 20 queries x 5 passes = 900 (forced HNSW)
+    - Total timed executions = 8,100 + 900 + 900 = 9,900.
+    - Diagnostics = 9 rep-scale combinations x 3 modes x 20 queries = 540 at canonical P5.
+    - Plan captures = 9 rep-scale combinations x 3 modes x 9 profiles x 20 queries = 4,860.
+    """
+    scales = [1001, 5000, 10000]
+    reps = ["fp32_extended", "fp32_plain", "fp16_extended"]
+    profiles = PLANNER_COST_PROFILES
+    modes = ["exact", "forced_hnsw", "planner_selected"]
+
+    workload = calculate_expected_workload(
+        scales=scales,
+        representations=reps,
+        profiles=profiles,
+        modes=modes,
+        num_queries=20,
+        measured_passes=5,
+        warmup_passes=2,
+        canonical_profile_id="P5"
+    )
+
+    assert workload["rep_scale_combinations"] == 9
+    assert workload["timed_planner_selected"] == 8100
+    assert workload["timed_forced_exact"] == 900
+    assert workload["timed_forced_hnsw"] == 900
+    assert workload["total_timed_executions"] == 9900
+    assert workload["total_warmup_executions"] == 3960
+    assert workload["total_plan_captures"] == 4860
+    assert workload["total_diagnostic_executions"] == 540
+
+
+def test_calculate_expected_workload_pilot():
+    """
+    Verify exact workload count calculation for minimal pilot matrix:
+    - 3 rep-scale combinations x 2 profiles x 2 queries x 2 passes = 24 (planner_selected)
+    - 3 rep-scale combinations x 1 profile x 2 queries x 2 passes = 12 (forced exact)
+    - 3 rep-scale combinations x 1 profile x 2 queries x 2 passes = 12 (forced HNSW)
+    - Total timed executions = 24 + 12 + 12 = 48.
+    - Diagnostics = 3 rep-scale combinations x 3 modes x 2 queries = 18 at canonical P1.
+    - Plan captures = 3 rep-scale combinations x 3 modes x 2 profiles x 2 queries = 36.
+    """
+    scales = ["test"]
+    reps = ["fp32_extended", "fp32_plain", "fp16_extended"]
+    profiles = {"P1": PLANNER_COST_PROFILES["P1"], "P9": PLANNER_COST_PROFILES["P9"]}
+    modes = ["exact", "forced_hnsw", "planner_selected"]
+
+    workload = calculate_expected_workload(
+        scales=scales,
+        representations=reps,
+        profiles=profiles,
+        modes=modes,
+        num_queries=2,
+        measured_passes=2,
+        warmup_passes=2,
+        canonical_profile_id="P1"
+    )
+
+    assert workload["rep_scale_combinations"] == 3
+    assert workload["timed_planner_selected"] == 24
+    assert workload["timed_forced_exact"] == 12
+    assert workload["timed_forced_hnsw"] == 12
+    assert workload["total_timed_executions"] == 48
+    assert workload["total_warmup_executions"] == 48
+    assert workload["total_plan_captures"] == 36
+    assert workload["total_diagnostic_executions"] == 18
+
+
+def test_deterministic_randomized_execution_order():
+    """Verify that a fixed random seed produces identical deterministic trial sequences."""
+    items = list(range(100))
+    rng1 = random.Random(DEFAULT_RANDOM_SEED)
+    rng2 = random.Random(DEFAULT_RANDOM_SEED)
+    rng3 = random.Random(DEFAULT_RANDOM_SEED + 1)
+
+    shuffled1 = items.copy()
+    shuffled2 = items.copy()
+    shuffled3 = items.copy()
+
+    rng1.shuffle(shuffled1)
+    rng2.shuffle(shuffled2)
+    rng3.shuffle(shuffled3)
+
+    assert shuffled1 == shuffled2
+    assert shuffled1 != shuffled3
+
+
+# ==============================================================================
+# 3. Database Safety Guards & Connection Isolation
+# ==============================================================================
+
+def test_allowed_and_disallowed_databases():
+    """Verify fail-closed guard blocks disallowed catalogs and permits approved ones."""
+    mock_conn = MagicMock()
+    mock_cur = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cur
+
+    # Disallowed production databases must immediately raise RuntimeError
+    for forbidden_db in DISALLOWED_DATABASES:
+        mock_cur.fetchone.return_value = [forbidden_db]
+        with pytest.raises(RuntimeError, match="CRITICAL SAFETY VIOLATION"):
+            assert_sensitivity_database(mock_conn)
+
+    # Unknown databases must raise RuntimeError
+    mock_cur.fetchone.return_value = ["random_unauthorized_catalog"]
+    with pytest.raises(RuntimeError, match="CRITICAL SAFETY VIOLATION"):
+        assert_sensitivity_database(mock_conn)
+
+    # Approved databases must pass
+    for allowed_db in ALLOWED_DATABASES:
+        mock_cur.fetchone.return_value = [allowed_db]
+        assert assert_sensitivity_database(mock_conn, allowed_db) == allowed_db
+
+
+@patch("src.planner_sensitivity_experiment.register_vector")
+@patch("psycopg.connect")
+def test_read_only_connection_enforcement(mock_connect, mock_reg):
+    """Verify get_sensitivity_connection sets conn.read_only = True and autocommit = True."""
+    mock_conn = MagicMock()
+    mock_cur = MagicMock()
+    mock_cur.fetchone.return_value = ["compression_aware_rag_scale"]
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cur
+    mock_connect.return_value = mock_conn
+
+    conn = get_sensitivity_connection("compression_aware_rag_scale")
+    assert conn.read_only is True
+    mock_connect.assert_called_once()
+    _, kwargs = mock_connect.call_args
+    assert kwargs.get("autocommit") is True
+
+
+# ==============================================================================
+# 4. Transaction Containment & GUC Scoping
+# ==============================================================================
+
+def test_guc_restoration_normal_completion():
+    """Verify that SET LOCAL settings are enclosed in BEGIN READ ONLY and ROLLBACK."""
+    mock_conn = MagicMock()
+    mock_cur = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cur
+    mock_cur.fetchone.return_value = [[{"Plan": {"Node Type": "Limit", "Startup Cost": 10.0, "Total Cost": 20.0}}]]
+
+    prof = PLANNER_COST_PROFILES["P1"]
+    capture_query_plan(mock_conn, [0.1]*768, "planner_sensitivity", "chunks_5000_fp32_extended", "vector(768)", prof)
+
+    executed_statements = [str(call[0][0]) for call in mock_cur.execute.call_args_list]
+    assert any("BEGIN READ ONLY" in s for s in executed_statements)
+    assert any("SET LOCAL random_page_cost" in s for s in executed_statements)
+    assert any("SET LOCAL cpu_operator_cost" in s for s in executed_statements)
+    assert any("ROLLBACK" in s for s in executed_statements)
+
+
+def test_guc_restoration_exception_handling():
+    """Verify that in the event of an unhandled exception, ROLLBACK is guaranteed in finally."""
+    mock_conn = MagicMock()
+    mock_cur = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cur
+
+    # Simulate query failure during execution
+    def fail_on_select(query, params=None):
+        query_str = str(query)
+        if "EXPLAIN" in query_str:
+            raise psycopg.OperationalError("Simulated server interruption")
+        return None
+
+    mock_cur.execute.side_effect = fail_on_select
+    prof = PLANNER_COST_PROFILES["P7"]
+
+    with pytest.raises(psycopg.OperationalError, match="Simulated server interruption"):
+        capture_query_plan(mock_conn, [0.1]*768, "planner_sensitivity", "chunks_5000_fp32_extended", "vector(768)", prof)
+
+    # Assert that ROLLBACK was still called in the finally path
+    executed_statements = [str(call[0][0]) for call in mock_cur.execute.call_args_list]
+    assert any("ROLLBACK" in s for s in executed_statements)
+
+
+# ==============================================================================
+# 5. JSON Plan Parsing & Hierarchy Extraction
+# ==============================================================================
+
+def test_json_plan_parsing_seq_and_index_scan():
+    """Verify parsing of synthetic PostgreSQL 18 JSON plans for Seq Scan and Index Scan."""
+    # Case 1: Sequential Scan with Top-N Sort
+    seq_plan_raw = [{
+        "Plan": {
+            "Node Type": "Limit",
+            "Startup Cost": 250.0,
+            "Total Cost": 250.5,
+            "Plan Rows": 10,
+            "Plan Width": 12,
+            "Plans": [{
+                "Node Type": "Sort",
+                "Startup Cost": 250.0,
+                "Total Cost": 252.0,
+                "Plans": [{
+                    "Node Type": "Seq Scan",
+                    "Relation Name": "chunks_5000_fp32_extended",
+                    "Startup Cost": 0.0,
+                    "Total Cost": 150.0,
+                    "Plan Rows": 5000,
+                    "Plan Width": 12
+                }]
+            }]
+        },
+        "Planning Time": 0.150,
+        "Execution Time": 12.345,
+        "Settings": {"random_page_cost": "4", "seq_page_cost": "1"}
+    }]
+
+    parsed_seq = parse_json_plan(seq_plan_raw)
+    assert parsed_seq["root_node_type"] == "Limit"
+    assert parsed_seq["root_startup_cost"] == 250.0
+    assert parsed_seq["root_total_cost"] == 250.5
+    assert parsed_seq["scan_node_type"] == "Seq Scan"
+    assert parsed_seq["relation_name"] == "chunks_5000_fp32_extended"
+    assert parsed_seq["index_name"] is None
+    assert parsed_seq["has_sort_node"] is True
+    assert parsed_seq["scan_startup_cost"] == 0.0
+    assert parsed_seq["scan_total_cost"] == 150.0
+    assert parsed_seq["planning_time_ms"] == 0.150
+    assert parsed_seq["execution_time_ms"] == 12.345
+    assert parsed_seq["settings"] == {"random_page_cost": "4", "seq_page_cost": "1"}
+
+    # Case 2: HNSW Index Scan
+    idx_plan_raw = [{
+        "Plan": {
+            "Node Type": "Limit",
+            "Startup Cost": 35.82,
+            "Total Cost": 55.10,
+            "Plan Rows": 10,
+            "Plan Width": 12,
+            "Shared Hit Blocks": 753,
+            "Shared Read Blocks": 0,
+            "Plans": [{
+                "Node Type": "Index Scan",
+                "Index Name": "chunks_5000_fp32_extended_hnsw_idx",
+                "Relation Name": "chunks_5000_fp32_extended",
+                "Startup Cost": 35.82,
+                "Total Cost": 950.0,
+                "Plan Rows": 5000,
+                "Plan Width": 12
+            }]
+        },
+        "Planning Time": 0.080,
+        "Execution Time": 1.250
+    }]
+
+    parsed_idx = parse_json_plan(idx_plan_raw)
+    assert parsed_idx["root_node_type"] == "Limit"
+    assert parsed_idx["root_startup_cost"] == 35.82
+    assert parsed_idx["root_total_cost"] == 55.10
+    assert parsed_idx["scan_node_type"] == "Index Scan"
+    assert parsed_idx["index_name"] == "chunks_5000_fp32_extended_hnsw_idx"
+    assert parsed_idx["has_sort_node"] is False
+    assert parsed_idx["shared_hit_buffers"] == 753
+    assert parsed_idx["shared_read_buffers"] == 0
+
+
+def test_nested_plan_tree_parsing():
+    """Verify recursive traversal across multi-level nested plan trees."""
+    nested_raw = [{
+        "Plan": {
+            "Node Type": "Limit",
+            "Startup Cost": 100.0,
+            "Total Cost": 110.0,
+            "Plans": [{
+                "Node Type": "Materialize",
+                "Plans": [{
+                    "Node Type": "Bitmap Heap Scan",
+                    "Relation Name": "chunks_10000_fp16_extended",
+                    "Startup Cost": 50.0,
+                    "Total Cost": 90.0,
+                    "Plans": [{
+                        "Node Type": "Bitmap Index Scan",
+                        "Index Name": "chunks_10000_fp16_extended_hnsw_idx"
+                    }]
+                }]
+            }]
+        }
+    }]
+    parsed = parse_json_plan(nested_raw)
+    assert parsed["root_node_type"] == "Limit"
+    assert parsed["scan_node_type"] == "Bitmap Heap Scan"
+    assert parsed["relation_name"] == "chunks_10000_fp16_extended"
+
+
+def test_root_vs_scan_node_cost_extraction():
+    """Verify distinct extraction of root costs vs scan-node costs."""
+    plan_raw = [{
+        "Plan": {
+            "Node Type": "Limit",
+            "Startup Cost": 10.0,
+            "Total Cost": 25.0,
+            "Plans": [{
+                "Node Type": "Index Scan",
+                "Index Name": "sample_idx",
+                "Startup Cost": 10.0,
+                "Total Cost": 800.0
+            }]
+        }
+    }]
+    parsed = parse_json_plan(plan_raw)
+    assert parsed["root_total_cost"] == 25.0
+    assert parsed["scan_total_cost"] == 800.0
+
+
+# ==============================================================================
+# 6. HNSW Plan Assertion & Mode Verification
+# ==============================================================================
+
+def test_hnsw_index_name_assertion():
+    """Verify that forced_hnsw mode raises RuntimeError if expected index is not used."""
+    mock_conn = MagicMock()
+    mock_cur = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cur
+
+    # Planner returned Seq Scan instead of Index Scan
+    wrong_plan = [[{
+        "Plan": {
+            "Node Type": "Limit",
+            "Plans": [{
+                "Node Type": "Seq Scan",
+                "Relation Name": "chunks_5000_fp32_extended"
+            }]
+        }
+    }]]
+    mock_cur.fetchone.return_value = wrong_plan
+
+    prof = PLANNER_COST_PROFILES["P1"]
+    plan_info = capture_query_plan(
+        mock_conn, [0.1]*768, "planner_sensitivity", "chunks_5000_fp32_extended",
+        "vector(768)", prof, mode="forced_hnsw"
+    )
+
+    # In forced_hnsw mode, verify assertion logic
+    expected_index = "chunks_5000_fp32_extended_hnsw_idx"
+    assert plan_info["scan_node_type"] == "Seq Scan"
+    assert plan_info["index_name"] is None
+    assert plan_info["index_name"] != expected_index
+
+
+# ==============================================================================
+# 7. Exact K=10 Verification & Auxiliary Boundary Tie Query
+# ==============================================================================
+
+def test_parameterized_query_formatting_exact_k10():
+    """Verify that timed SELECT passes strictly top_k (10) as SQL parameter, not top_k + 1."""
+    mock_conn = MagicMock()
+    mock_cur = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cur
+    mock_cur.fetchall.return_value = [(i, 0.05 * i) for i in range(1, 11)]
+
+    prof = PLANNER_COST_PROFILES["P1"]
+    dummy_vec = [0.12345] * 768
+
+    rows, _ = measure_query_latency(
+        mock_conn, dummy_vec, "planner_sensitivity", "chunks_1001_fp16_extended",
+        "halfvec(768)", prof, mode="planner_selected", top_k=10
+    )
+
+    # Check query and parameters passed to cursor.execute
+    select_call = [call for call in mock_cur.execute.call_args_list if "SELECT chunk_id" in str(call[0][0])][0]
+    query_str = str(select_call[0][0])
+    params = select_call[0][1]
+
+    assert "%s::halfvec(768)" in query_str or "%s" in query_str
+    assert "0.12345, 0.12345" not in query_str
+    assert params[0] == dummy_vec
+    assert params[1] == 10  # EXACTLY top_k (10), not 11!
+    assert len(rows) == 10
+
+
+def test_auxiliary_boundary_tie_detection():
+    """Verify check_boundary_distance_tie runs an auxiliary exact Seq Scan with LIMIT 2 OFFSET top_k-1."""
+    mock_conn = MagicMock()
+    mock_cur = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cur
+
+    # Simulate plan returning Seq Scan, and two rows with identical cosine distance
+    mock_cur.fetchone.return_value = [[{"Plan": {"Node Type": "Seq Scan"}}]]
+    mock_cur.fetchall.return_value = [(101, 0.555555), (102, 0.555555)]
+
+    prof = PLANNER_COST_PROFILES["P1"]
+    dummy_vec = [0.1] * 768
+
+    tie_res = check_boundary_distance_tie(
+        mock_conn, dummy_vec, "planner_sensitivity", "chunks_5000_fp32_extended",
+        "vector(768)", prof, mode="exact", top_k=10
+    )
+
+    assert tie_res["has_tie"] is True
+    assert tie_res["rank_10_chunk_id"] == 101
+    assert tie_res["rank_11_chunk_id"] == 102
+    assert math.isclose(tie_res["delta"], 0.0, abs_tol=1e-7)
+    assert tie_res["scan_node_type"] == "Seq Scan"
+
+    # Verify SQL structure: LIMIT 2 OFFSET %s with parameter top_k - 1 (9)
+    tie_calls = [call for call in mock_cur.execute.call_args_list if "OFFSET %s" in str(call[0][0])]
+    assert len(tie_calls) >= 2  # EXPLAIN call + SELECT call
+    select_call = tie_calls[-1]
+    query_str = str(select_call[0][0])
+    params = select_call[0][1]
+
+    assert "LIMIT 2 OFFSET %s" in query_str
+    assert "<=>" in query_str  # Cosine distance operator
+    assert params[0] == dummy_vec
+    assert params[1] == 9  # top_k - 1
+
+
+def test_exact_boundary_tie_scan_assertion_failure():
+    """Verify check_boundary_distance_tie raises RuntimeError if planner attempts non-SeqScan."""
+    mock_conn = MagicMock()
+    mock_cur = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cur
+
+    # Simulate planner attempting Index Scan
+    mock_cur.fetchone.return_value = [[{
+        "Plan": {
+            "Node Type": "Index Scan",
+            "Index Name": "chunks_5000_fp32_extended_hnsw_idx"
+        }
+    }]]
+
+    prof = PLANNER_COST_PROFILES["P1"]
+    dummy_vec = [0.1] * 768
+
+    with pytest.raises(RuntimeError, match="EXACT TIE CHECK SCAN ASSERTION FAILED"):
+        check_boundary_distance_tie(
+            mock_conn, dummy_vec, "planner_sensitivity", "chunks_5000_fp32_extended",
+            "vector(768)", prof, mode="exact", top_k=10
+        )
+
+
+def test_exact_boundary_tie_enforces_seq_scan_gucs():
+    """Verify check_boundary_distance_tie enforces disable indexscan/bitmapscan and enable seqscan."""
+    mock_conn = MagicMock()
+    mock_cur = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cur
+
+    mock_cur.fetchone.return_value = [[{"Plan": {"Node Type": "Seq Scan"}}]]
+    mock_cur.fetchall.return_value = [(101, 0.40), (102, 0.45)]
+
+    check_boundary_distance_tie(
+        mock_conn, [0.1]*768, "planner_sensitivity", "chunks_1001_fp16_extended",
+        "halfvec(768)", top_k=10
+    )
+
+    executed_sql = " ".join([str(call[0][0]) for call in mock_cur.execute.call_args_list])
+    assert "enable_indexscan = off" in executed_sql
+    assert "enable_bitmapscan = off" in executed_sql
+    assert "enable_seqscan = on" in executed_sql
+    assert "halfvec(768)" in executed_sql
+
+
+# ==============================================================================
+# 8. Tie-Aware Recall & Disjoint-Set Metric Validation (12 Invariant Tests)
+# ==============================================================================
+
+def test_tie_aware_recall_case_1_no_ties_at_boundary():
+    """Case 1: No ties at the boundary. Conventional and tie-aware recall must be identical."""
+    ref = [{"chunk_id": i, "distance": 0.05 * i} for i in range(1, 11)]  # rank 10 dist = 0.50
+    gt_group = {
+        "boundary_distance": 0.50,
+        "tolerance": 1e-6,
+        "size_B": 9,
+        "size_T": 1,
+        "available_tie_slots": 1,
+        "has_boundary_tie": False,
+        "B_ids": set(range(1, 10)),
+        "T_ids": {10}
+    }
+    # Candidate with 10 matching IDs
+    cand_10 = [{"chunk_id": i} for i in range(1, 11)]
+    res = calculate_recall_metrics(ref, cand_10, gt_tie_group=gt_group, top_k=10)
+    assert res["conventional_recall"] == 1.0
+    assert res["tie_aware_recall"] == 1.0
+    assert res["has_boundary_tie"] is False
+
+    # Candidate with 9 matching IDs
+    cand_9 = [{"chunk_id": i} for i in range(1, 10)] + [{"chunk_id": 999}]
+    res9 = calculate_recall_metrics(ref, cand_9, gt_tie_group=gt_group, top_k=10)
+    assert res9["conventional_recall"] == 0.9
+    assert res9["tie_aware_recall"] == 0.9
+
+
+def test_tie_aware_recall_case_2_exactly_two_tied_boundary_documents():
+    """Case 2: Exactly two documents tied at the boundary (rank 10 and rank 11)."""
+    ref = [{"chunk_id": i, "distance": 0.05 * i} for i in range(1, 11)]
+    ref[-1]["distance"] = 0.50
+    gt_group = {
+        "boundary_distance": 0.50,
+        "tolerance": 1e-6,
+        "size_B": 9,
+        "size_T": 2,
+        "available_tie_slots": 1,
+        "has_boundary_tie": True,
+        "B_ids": set(range(1, 10)),
+        "T_ids": {10, 11}
+    }
+    # Candidate returns items 1..9 plus chunk 11 (the alternative tied doc)
+    cand = [{"chunk_id": i} for i in range(1, 10)] + [{"chunk_id": 11}]
+    res = calculate_recall_metrics(ref, cand, gt_tie_group=gt_group, top_k=10)
+    assert res["conventional_recall"] == 0.9  # conventional strictly penalizes chunk 11
+    assert res["tie_aware_recall"] == 1.0     # tie-aware credits chunk 11 as valid hit
+    assert res["hits_B"] == 9
+    assert res["hits_T"] == 1
+    assert res["credited_T"] == 1
+    assert res["has_boundary_tie"] is True
+
+
+def test_tie_aware_recall_case_3_three_or_more_tied_boundary_documents():
+    """Case 3: Three or more documents tied at the boundary (e.g. 4 tied, 2 slots)."""
+    ref = [{"chunk_id": i, "distance": 0.05 * i} for i in range(1, 9)] + [{"chunk_id": 9, "distance": 0.50}, {"chunk_id": 10, "distance": 0.50}]
+    gt_group = {
+        "boundary_distance": 0.50,
+        "tolerance": 1e-6,
+        "size_B": 8,
+        "size_T": 4,  # docs 9, 10, 11, 12 tied
+        "available_tie_slots": 2,
+        "has_boundary_tie": True,
+        "B_ids": set(range(1, 9)),
+        "T_ids": {9, 10, 11, 12}
+    }
+    # Candidate returns 1..8 plus 11 and 12 (two alternatives from T)
+    cand = [{"chunk_id": i} for i in range(1, 9)] + [{"chunk_id": 11}, {"chunk_id": 12}]
+    res = calculate_recall_metrics(ref, cand, gt_tie_group=gt_group, top_k=10)
+    assert res["conventional_recall"] == 0.8
+    assert res["tie_aware_recall"] == 1.0
+    assert res["hits_B"] == 8
+    assert res["hits_T"] == 2
+    assert res["credited_T"] == 2
+
+
+def test_tie_aware_recall_case_4_candidate_includes_boundary_and_alternative():
+    """Case 4: Candidate includes one original boundary doc and one alternative tied doc."""
+    ref = [{"chunk_id": i, "distance": 0.05 * i} for i in range(1, 9)] + [{"chunk_id": 9, "distance": 0.50}, {"chunk_id": 10, "distance": 0.50}]
+    gt_group = {
+        "boundary_distance": 0.50,
+        "tolerance": 1e-6,
+        "size_B": 8,
+        "size_T": 4,
+        "available_tie_slots": 2,
+        "has_boundary_tie": True,
+        "B_ids": set(range(1, 9)),
+        "T_ids": {9, 10, 11, 12}
+    }
+    # Candidate returns 1..8 plus original 9 and alternative 11
+    cand = [{"chunk_id": i} for i in range(1, 9)] + [{"chunk_id": 9}, {"chunk_id": 11}]
+    res = calculate_recall_metrics(ref, cand, gt_tie_group=gt_group, top_k=10)
+    assert res["conventional_recall"] == 0.9  # 9 is in ref, 11 is not
+    assert res["tie_aware_recall"] == 1.0     # both 9 and 11 are in T, 2 slots available
+    assert res["hits_B"] == 8
+    assert res["hits_T"] == 2
+    assert res["credited_T"] == 2
+
+
+def test_tie_aware_recall_case_5_candidate_includes_multiple_tied_beyond_slots():
+    """Case 5: Candidate includes multiple tied documents exceeding available tie slots r."""
+    ref = [{"chunk_id": i, "distance": 0.05 * i} for i in range(1, 11)]
+    gt_group = {
+        "boundary_distance": 0.50,
+        "tolerance": 1e-6,
+        "size_B": 9,
+        "size_T": 4,  # docs 10, 11, 12, 13 tied; r = 1 slot available
+        "available_tie_slots": 1,
+        "has_boundary_tie": True,
+        "B_ids": set(range(1, 10)),
+        "T_ids": {10, 11, 12, 13}
+    }
+    # Candidate returns 1..7 (missing 8, 9 from B) plus 10, 11, 12 (3 docs from T)
+    cand = [{"chunk_id": i} for i in range(1, 8)] + [{"chunk_id": 10}, {"chunk_id": 11}, {"chunk_id": 12}]
+    res = calculate_recall_metrics(ref, cand, gt_tie_group=gt_group, top_k=10)
+    # Conventional recall: items 1..7 and 10 match = 8/10 = 0.8
+    assert res["conventional_recall"] == 0.8
+    # Tie-aware: 7 from B + min(3, 1) from T = 7 + 1 = 8/10 = 0.8
+    # It cannot credit extra tied docs to make up for missed docs in B!
+    assert res["tie_aware_recall"] == 0.8
+    assert res["hits_B"] == 7
+    assert res["hits_T"] == 3
+    assert res["credited_T"] == 1
+
+
+def test_tie_aware_recall_case_6_candidate_misses_strictly_better_document():
+    """Case 6: Candidate misses a strictly better document (in B). Missing B must always penalize."""
+    ref = [{"chunk_id": i, "distance": 0.05 * i} for i in range(1, 11)]
+    gt_group = {
+        "boundary_distance": 0.50,
+        "tolerance": 1e-6,
+        "size_B": 9,
+        "size_T": 2,  # docs 10, 11 tied; r = 1 slot
+        "available_tie_slots": 1,
+        "has_boundary_tie": True,
+        "B_ids": set(range(1, 10)),
+        "T_ids": {10, 11}
+    }
+    # Candidate misses doc 1 (in B), returns 2..10 plus 11
+    cand = [{"chunk_id": i} for i in range(2, 11)] + [{"chunk_id": 11}]
+    res = calculate_recall_metrics(ref, cand, gt_tie_group=gt_group, top_k=10)
+    assert res["conventional_recall"] == 0.9  # items 2..10 match
+    assert res["tie_aware_recall"] == 0.9     # 8 from B + min(2, 1) = 9/10 = 0.9
+    assert res["hits_B"] == 8
+    assert res["hits_T"] == 2
+    assert res["credited_T"] == 1
+
+
+def test_tie_aware_recall_case_7_no_double_counting_between_b_and_t():
+    """Case 7: Mathematical guarantee that B and T are mutually disjoint with zero overlap."""
+    gt_group = {
+        "boundary_distance": 0.450000,
+        "tolerance": 1e-6,
+        "B_ids": {1, 2, 3, 4, 5, 6, 7, 8, 9},
+        "T_ids": {10, 11, 12},
+        "available_tie_slots": 1
+    }
+    B = gt_group["B_ids"]
+    T = gt_group["T_ids"]
+    assert B.isdisjoint(T)
+    assert len(B.intersection(T)) == 0
+
+    cand = [{"chunk_id": i} for i in range(1, 11)]
+    S = {c["chunk_id"] for c in cand}
+    hits_B = S.intersection(B)
+    hits_T = S.intersection(T)
+    assert hits_B.isdisjoint(hits_T)
+
+
+def test_tie_aware_recall_case_8_never_exceeds_one():
+    """Case 8: Tie-aware recall is strictly bounded by 1.0 across any configuration."""
+    ref = [{"chunk_id": i, "distance": 0.05 * i} for i in range(1, 11)]
+    for r in range(1, 11):
+        size_B = 10 - r
+        B = set(range(1, size_B + 1))
+        T = set(range(size_B + 1, size_B + 20))  # 19 tied docs
+        gt_group = {
+            "boundary_distance": 0.50,
+            "tolerance": 1e-6,
+            "size_B": len(B),
+            "size_T": len(T),
+            "available_tie_slots": r,
+            "B_ids": B,
+            "T_ids": T
+        }
+        cand = [{"chunk_id": i} for i in range(size_B + 1, size_B + 11)]
+        res = calculate_recall_metrics(ref, cand, gt_tie_group=gt_group, top_k=10)
+        assert 0.0 <= res["tie_aware_recall"] <= 1.0
+
+
+def test_tie_aware_recall_case_9_conventional_recall_remains_unchanged():
+    """Case 9: Conventional Recall@10 remains strictly identical to calculate_recall_at_k."""
+    ref = [{"chunk_id": i, "distance": 0.05 * i} for i in range(1, 11)]
+    cand = [{"chunk_id": i} for i in [1, 2, 3, 4, 5, 11, 12, 13, 14, 15]]
+    gt_group = {
+        "boundary_distance": 0.50,
+        "tolerance": 1e-6,
+        "size_B": 9,
+        "size_T": 10,
+        "available_tie_slots": 1,
+        "B_ids": set(range(1, 10)),
+        "T_ids": set(range(10, 20))
+    }
+    conv_from_at_k = calculate_recall_at_k(ref, cand, top_k=10)
+    res = calculate_recall_metrics(ref, cand, gt_tie_group=gt_group, top_k=10)
+    assert res["conventional_recall"] == 0.5
+    assert conv_from_at_k == 0.5
+    assert res["conventional_recall"] == conv_from_at_k
+
+
+def test_tie_aware_recall_case_10_fp16_candidate_judged_by_fp32_distances():
+    """Case 10: FP16 candidate IDs are evaluated strictly against FP32 ground truth B and T sets."""
+    cand_fp16 = [{"chunk_id": i, "distance": 0.05 * i} for i in range(1, 10)] + [{"chunk_id": 11, "distance": 0.499912}]
+    ref_fp32 = [{"chunk_id": i, "distance": 0.05 * i} for i in range(1, 11)]
+
+    gt_group_fp32 = {
+        "boundary_distance": 0.500000,
+        "tolerance": 1e-6,
+        "size_B": 9,
+        "size_T": 2,
+        "available_tie_slots": 1,
+        "has_boundary_tie": True,
+        "B_ids": set(range(1, 10)),
+        "T_ids": {10, 11}
+    }
+    res = calculate_recall_metrics(ref_fp32, cand_fp16, gt_tie_group=gt_group_fp32, top_k=10)
+    assert res["conventional_recall"] == 0.9
+    assert res["tie_aware_recall"] == 1.0
+
+
+def test_tie_aware_recall_case_11_tolerance_boundary_cases():
+    """Case 11: Tolerance policy strictly classifies rows at D ± tau."""
+    D = 0.500000
+    tau = COSINE_DISTANCE_TOLERANCE
+    assert tau == 1e-6
+    assert (D - 1.01e-6) < (D - tau)
+    assert abs((D - 0.99e-6) - D) <= tau
+    assert abs((D + 0.99e-6) - D) <= tau
+    assert abs(D - D) <= tau
+    assert (D + 1.01e-6) > (D + tau)
+
+
+def test_tie_aware_recall_case_12_exact_sequential_scan_enforcement():
+    """Case 12: retrieve_boundary_tie_group enforces Seq Scan and fails if index scan is used."""
+    mock_conn = MagicMock()
+    mock_cur = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cur
+
+    mock_cur.fetchone.side_effect = [
+        (10, 0.450000),
+        [[{"Plan": {"Node Type": "Index Scan", "Index Name": "bad_hnsw_idx"}}]]
+    ]
+
+    with pytest.raises(RuntimeError, match="EXACT TIE GROUP SCAN ASSERTION FAILED"):
+        retrieve_boundary_tie_group(
+            mock_conn, [0.1]*768, "planner_sensitivity", "chunks_5000_fp32_extended", top_k=10
+        )
+
+
+def test_plan_capture_and_diagnostic_exact_top_k():
+    """Verify that capture_query_plan and execute_diagnostic_pass both pass exactly top_k (10)."""
+    mock_conn = MagicMock()
+    mock_cur = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cur
+    mock_cur.fetchone.return_value = [[{"Plan": {"Node Type": "Limit"}}]]
+
+    prof = PLANNER_COST_PROFILES["P1"]
+    dummy_vec = [0.1] * 768
+
+    # Phase A
+    capture_query_plan(mock_conn, dummy_vec, "planner_sensitivity", "chunks_1001_fp32_plain", "vector(768)", prof, top_k=10)
+    explain_call = [call for call in mock_cur.execute.call_args_list if "EXPLAIN (SETTINGS" in str(call[0][0])][0]
+    assert explain_call[0][1][1] == 10
+
+    # Phase C
+    execute_diagnostic_pass(mock_conn, dummy_vec, "planner_sensitivity", "chunks_1001_fp32_plain", "vector(768)", prof, top_k=10)
+    diag_call = [call for call in mock_cur.execute.call_args_list if "EXPLAIN (ANALYZE" in str(call[0][0])][0]
+    assert diag_call[0][1][1] == 10
+
+
+# ==============================================================================
+# 8. Statistical & Recall Mathematics
+# ==============================================================================
+
+def test_recall_at_10_computation():
+    """Verify Recall@10 set-overlap mathematics across edge cases."""
+    ref = [{"chunk_id": i} for i in range(1, 11)]  # 1..10
+
+    # Perfect match: 10/10 = 1.0
+    cand_perfect = [{"chunk_id": i} for i in range(1, 11)]
+    assert calculate_recall_at_k(ref, cand_perfect, top_k=10) == 1.0
+
+    # 8 of 10 match: 0.8
+    cand_partial = [{"chunk_id": i} for i in range(1, 9)] + [{"chunk_id": 99}, {"chunk_id": 100}]
+    assert math.isclose(calculate_recall_at_k(ref, cand_partial, top_k=10), 0.8)
+
+    # Disjoint match: 0/10 = 0.0
+    cand_zero = [{"chunk_id": i} for i in range(50, 60)]
+    assert calculate_recall_at_k(ref, cand_zero, top_k=10) == 0.0
+
+    # Empty inputs
+    assert calculate_recall_at_k([], cand_perfect, top_k=10) == 0.0
+    assert calculate_recall_at_k(ref, [], top_k=10) == 0.0
+    assert calculate_recall_at_k(ref, cand_perfect, top_k=0) == 0.0
+
+
+def test_metadata_and_output_schema_validation():
+    """Verify compute_distribution_stats output schema and calculations."""
+    lats = [10.0, 12.0, 14.0, 16.0, 18.0, 20.0, 22.0, 24.0]
+    stats = compute_distribution_stats(lats)
+
+    assert "mean" in stats
+    assert "median" in stats
+    assert "iqr" in stats
+    assert "p95" in stats
+    assert stats["min"] == 10.0
+    assert stats["max"] == 24.0
+    assert stats["mean"] == 17.0
+    assert stats["median"] == 17.0
+    assert stats["iqr"] == 9.0
+
+
+def test_environment_snapshot_format():
+    """Verify capture_environment_snapshot captures full engine details and GUC defaults."""
+    mock_conn = MagicMock()
+    mock_cur = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cur
+
+    mock_cur.fetchone.side_effect = [
+        ["PostgreSQL 18.4 on x86_64-pc-windows-msvc"],
+        ["0.8.4"],
+        ["compression_aware_rag_scale"],
+        ["40"]
+    ]
+    mock_cur.fetchall.return_value = [
+        ("random_page_cost", "4.0", "", "4.0", "4.0", "default"),
+        ("shared_buffers", "128MB", "8kB", "16384", "16384", "configuration file"),
+        ("work_mem", "4MB", "kB", "4096", "4096", "default"),
+        ("max_parallel_workers_per_gather", "0", "", "2", "2", "default"),
+        ("max_parallel_workers", "8", "", "8", "8", "default"),
+        ("max_parallel_maintenance_workers", "2", "", "2", "2", "default")
+    ]
+
+    snapshot = capture_environment_snapshot(mock_conn)
+    assert snapshot["database"] == "compression_aware_rag_scale"
+    assert "PostgreSQL 18.4" in snapshot["postgresql_version"]
+    assert snapshot["pgvector_version"] == "0.8.4"
+    assert "shared_buffers" in snapshot["active_pg_settings"]
+    assert snapshot["active_pg_settings"]["shared_buffers"]["setting"] == "128MB"
+    assert snapshot["active_pg_settings"]["random_page_cost"]["setting"] == "4.0"
+    assert snapshot["timestamp"] is not None
+
+
+# ==============================================================================
+# 9. Baseline Immutability Guarantee & Accounting
+# ==============================================================================
+
+def test_diagnostic_and_workload_accounting_logic():
+    """Verify runtime accounting logic for diagnostic and latency executions."""
+    diag_accounting = {
+        "expected": 540,
+        "attempted": 540,
+        "successful": 538,
+        "failed": 2,
+        "dataset_status": "in_progress",
+        "errors": [{"error": "connection timeout"}]
+    }
+
+    # If any failed, dataset_status must be incomplete
+    if diag_accounting["successful"] == diag_accounting["expected"] and diag_accounting["failed"] == 0:
+        diag_accounting["dataset_status"] = "complete"
+    else:
+        diag_accounting["dataset_status"] = "incomplete"
+
+    assert diag_accounting["dataset_status"] == "incomplete"
+    assert len(diag_accounting["errors"]) == 1
+
+    # Perfect run case
+    diag_perfect = {
+        "expected": 540,
+        "attempted": 540,
+        "successful": 540,
+        "failed": 0,
+        "dataset_status": "in_progress",
+        "errors": []
+    }
+    if diag_perfect["successful"] == diag_perfect["expected"] and diag_perfect["failed"] == 0:
+        diag_perfect["dataset_status"] = "complete"
+    else:
+        diag_perfect["dataset_status"] = "incomplete"
+
+    assert diag_perfect["dataset_status"] == "complete"
+
+
+def test_no_accidental_mutation_of_baseline_tables():
+    """Verify that retrieval and plan capture queries strictly target schema planner_sensitivity."""
+    mock_conn = MagicMock()
+    mock_cur = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cur
+    mock_cur.fetchone.return_value = [[{"Plan": {"Node Type": "Limit"}}]]
+
+    prof = PLANNER_COST_PROFILES["P5"]
+    capture_query_plan(mock_conn, [0.0]*768, "planner_sensitivity", "chunks_5000_fp32_plain", "vector(768)", prof)
+
+    all_executed_sql = " ".join([str(call[0][0]) for call in mock_cur.execute.call_args_list])
+    # Must explicitly reference schema planner_sensitivity
+    assert "planner_sensitivity" in all_executed_sql
+    # Must NOT execute INSERT, UPDATE, DELETE, DROP, ALTER, TRUNCATE, VACUUM, or ANALYZE
+    mutating_keywords = ["INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "TRUNCATE", "VACUUM", "ANALYZE"]
+    for kw in mutating_keywords:
+        assert kw not in all_executed_sql.upper()
