@@ -76,7 +76,7 @@ planner_sensitivity
      * HNSW index graph size (~40 MB vs ~20 MB at 10k scale).
      * Distance operation implementation (`vector_cosine_ops` vs `halfvec_cosine_ops`).
      * Quantization noise resulting from IEEE 754 16-bit half-precision conversion.
-   - **Attribution Discipline:** Execution speedup observed in `halfvec` operations stems primarily from reduced disk/memory data footprint and higher buffer cache page density. Unmeasured hardware claims regarding memory bus saturation or SIMD execution are explicitly disclaimed unless independently isolated via hardware performance counters.
+   - **Attribution Discipline:** Any observed execution-time differences involving `halfvec` should be interpreted as associations with the representation change, not as evidence of a single causal mechanism. The present experiments do not isolate the individual effects of datum size, tuple density, buffer-cache behavior, or distance-operator implementation. Unmeasured hardware claims regarding memory bus saturation or SIMD execution are explicitly disclaimed unless independently isolated via hardware performance counters.
 
 ### 2.3 Atomic Fail-Closed Provisioning Workflow
 Each scale is provisioned within an isolated transaction (`autocommit=False`) with the following strict execution sequence:
