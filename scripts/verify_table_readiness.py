@@ -72,6 +72,19 @@ SCALE_SPECS = {
 
 REPRESENTATIONS = ["fp32_extended", "fp32_plain", "fp16_extended"]
 
+# PostgreSQL pg_attribute.attstorage specification:
+# 'p' = PLAIN (inline, uncompressed)
+# 'e' = EXTERNAL (secondary TOAST, uncompressed)
+# 'm' = MAIN (inline if fits, compressed if necessary before out-of-line)
+# 'x' = EXTENDED (secondary TOAST, compressed if compressible)
+ATTSTORAGE_MAP = {
+    'p': 'PLAIN',
+    'e': 'EXTERNAL',
+    'm': 'MAIN',
+    'x': 'EXTENDED',
+}
+
+
 
 def parse_reloptions(options_list: list[str] | None) -> dict:
     """Parses pg_class.reloptions list like ['m=16', 'ef_construction=64'] into a dict."""
@@ -197,7 +210,7 @@ def verify_scale_readiness(scale_tag: str, spec: dict) -> dict:
                 """, (f"{SCHEMA_NAME}.{tbl_name}",))
                 att_row = cur.fetchone()
                 storage_char = att_row[0] if att_row else None
-                storage_type = "PLAIN" if storage_char == "p" else "EXTENDED" if storage_char == "x" else "OTHER"
+                storage_type = ATTSTORAGE_MAP.get(storage_char, "OTHER")
                 storage_ok = (storage_type == expected_storage)
 
                 # Check HNSW index, operator class, and reloptions

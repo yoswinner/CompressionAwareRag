@@ -1794,6 +1794,10 @@ def main():
                         help="Canonical profile for forced-path timing (default: P4).")
     parser.add_argument("--random-seed", type=int, default=DEFAULT_RANDOM_SEED,
                         help="Random seed for deterministic trial presentation (default: 42).")
+    parser.add_argument("--warmup-passes", type=int, default=2,
+                        help="Number of warmup passes per query (default: 2).")
+    parser.add_argument("--measured-passes", type=int, default=5,
+                        help="Number of timed measurement passes per query (default: 5).")
     parser.add_argument("--pilot", action="store_true", default=False,
                         help="Run minimal pilot benchmark on test database (profiles P1 and P9, 2 queries, 2 passes).")
     parser.add_argument("--dry-run", action="store_true", default=False,
@@ -1837,6 +1841,8 @@ def main():
         representations=reps_to_run,
         profiles=profiles_to_run,
         canonical_profile_id=args.canonical_profile,
+        warmup_passes=args.warmup_passes,
+        measured_passes=args.measured_passes,
         random_seed=args.random_seed,
         output_dir=args.output_dir,
         dry_run=args.dry_run

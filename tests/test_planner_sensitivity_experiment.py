@@ -1173,9 +1173,9 @@ def test_provisioner_analyze_failure_triggers_rollback():
         ("chunks_1001_fp32_plain_pkey", 1),  # PK check rep 2
         (1001, 1001),  # row count & distinct count rep 3
         ("chunks_1001_fp16_extended_pkey", 1),  # PK check rep 3
-        ('e',),   # storage policy check rep 1
-        ('p',),   # storage policy check rep 2
-        ('e',),   # storage policy check rep 3
+        ('x',),   # storage policy check rep 1 (fp32_extended -> EXTENDED)
+        ('p',),   # storage policy check rep 2 (fp32_plain -> PLAIN)
+        ('x',),   # storage policy check rep 3 (fp16_extended -> EXTENDED)
         ('vector_cosine_ops', True),   # index check rep 1
         ('vector_cosine_ops', True),   # index check rep 2
         ('halfvec_cosine_ops', True),  # index check rep 3
@@ -1437,9 +1437,9 @@ def test_provisioner_sets_local_maintenance_work_mem():
         ("chunks_1001_fp32_plain_pkey", 1),  # PK check rep 2
         (1001, 1001),  # row count & distinct count rep 3
         ("chunks_1001_fp16_extended_pkey", 1),  # PK check rep 3
-        ('e',),   # storage policy check rep 1
-        ('p',),   # storage policy check rep 2
-        ('e',),   # storage policy check rep 3
+        ('x',),   # storage policy check rep 1 (fp32_extended -> EXTENDED)
+        ('p',),   # storage policy check rep 2 (fp32_plain -> PLAIN)
+        ('x',),   # storage policy check rep 3 (fp16_extended -> EXTENDED)
         ('vector_cosine_ops', True),   # index check rep 1
         ('vector_cosine_ops', True),   # index check rep 2
         ('halfvec_cosine_ops', True),  # index check rep 3
@@ -1632,6 +1632,71 @@ def test_bidirectional_parity_query_scenarios():
     # 4. Pairwise mismatch between T2 and T3 (T3 has ID not in T2)
     assert compute_6way_diff(s1, s2, {1, 2, 3, 4, 8}) > 0
     assert compute_6way_diff(s1, {1, 2, 3, 4, 9}, {1, 2, 3, 4, 8}) > 0
+
+
+def test_attstorage_label_mapping():
+    """Verify exact PostgreSQL pg_attribute.attstorage specification mapping across all 4 codes."""
+    from scripts.provision_planner_sensitivity import ATTSTORAGE_MAP as PROV_MAP
+    from scripts.verify_table_readiness import ATTSTORAGE_MAP as VERIFY_MAP
+
+    expected_mapping = {
+        'p': 'PLAIN',
+        'e': 'EXTERNAL',
+        'm': 'MAIN',
+        'x': 'EXTENDED',
+    }
+
+    # Verify provisioner map
+    assert PROV_MAP == expected_mapping
+    assert PROV_MAP['p'] == 'PLAIN'
+    assert PROV_MAP['e'] == 'EXTERNAL'
+    assert PROV_MAP['m'] == 'MAIN'
+    assert PROV_MAP['x'] == 'EXTENDED'
+
+    # Verify readiness map
+    assert VERIFY_MAP == expected_mapping
+    assert VERIFY_MAP['p'] == 'PLAIN'
+    assert VERIFY_MAP['e'] == 'EXTERNAL'
+    assert VERIFY_MAP['m'] == 'MAIN'
+    assert VERIFY_MAP['x'] == 'EXTENDED'
+
+    # Assert that none of the four codes produce an unexpected or reversed label
+    assert PROV_MAP['e'] != 'EXTENDED', "attstorage 'e' must not map to EXTENDED"
+    assert PROV_MAP['x'] != 'EXTERNAL', "attstorage 'x' must not map to EXTERNAL"
+    assert VERIFY_MAP['e'] != 'EXTENDED', "attstorage 'e' must not map to EXTENDED"
+    assert VERIFY_MAP['x'] != 'EXTERNAL', "attstorage 'x' must not map to EXTERNAL"
+
+
+def test_inspect_table_metrics_storage_policy():
+    """Verify inspect_table_metrics applies correct storage policy labels for p, e, m, x."""
+    from scripts.provision_planner_sensitivity import inspect_table_metrics
+    from unittest.mock import MagicMock
+
+    mock_conn = MagicMock()
+    mock_cur = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cur
+
+    for code, expected_label in [('p', 'PLAIN'), ('e', 'EXTERNAL'), ('m', 'MAIN'), ('x', 'EXTENDED')]:
+        mock_cur.fetchone.side_effect = [
+            (100000, 10, 1001.0), # heap_b, relpages, reltuples
+            (220000,),            # total_inc_b
+            (12345,),             # toast_oid
+            (50000,),             # toast_tbl_b
+            (10000,),             # toast_idx_b
+            (40000,),             # idx_bytes (hnsw)
+            (20000,),             # pk_bytes
+            (1001,),              # actual_rows
+            (code,),              # attstorage
+            (3072, 3072, 3072.0), # min, max, avg col sizes
+        ]
+        mock_cur.fetchall.side_effect = [
+            [(768,)],             # vector_dims
+        ]
+        res = inspect_table_metrics(mock_conn, "1001", "fp32_extended")
+        assert res["storage_policy"] == expected_label, (
+            f"Code {code} expected {expected_label}, got {res['storage_policy']}"
+        )
+
 
 
 

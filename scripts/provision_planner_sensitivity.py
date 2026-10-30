@@ -91,6 +91,19 @@ SCALE_SPECS = {
 
 REPRESENTATIONS = ["fp32_extended", "fp32_plain", "fp16_extended"]
 
+# PostgreSQL pg_attribute.attstorage specification:
+# 'p' = PLAIN (inline, uncompressed)
+# 'e' = EXTERNAL (secondary TOAST, uncompressed)
+# 'm' = MAIN (inline if fits, compressed if necessary before out-of-line)
+# 'x' = EXTENDED (secondary TOAST, compressed if compressible)
+ATTSTORAGE_MAP = {
+    'p': 'PLAIN',
+    'e': 'EXTERNAL',
+    'm': 'MAIN',
+    'x': 'EXTENDED',
+}
+
+
 
 def assert_approved_database(conn: psycopg.Connection, expected_db: str) -> str:
     """Fail-closed assertion ensuring target database is strictly allowed."""
@@ -468,8 +481,7 @@ def inspect_table_metrics(
             WHERE n.nspname = %s AND c.relname = %s AND a.attname = 'embedding';
         """, (SCHEMA_NAME, table_name))
         storage_policy_code = cur.fetchone()[0]
-        policy_map = {'p': 'PLAIN', 'e': 'EXTENDED', 'm': 'MAIN', 'x': 'EXTERNAL'}
-        storage_policy = policy_map.get(storage_policy_code, storage_policy_code)
+        storage_policy = ATTSTORAGE_MAP.get(storage_policy_code, storage_policy_code)
 
         cur.execute(sql.SQL("""
             SELECT min(pg_column_size(embedding)), max(pg_column_size(embedding)), avg(pg_column_size(embedding))
@@ -488,6 +500,9 @@ def inspect_table_metrics(
             "reltuples": float(reltuples),
             "relpages": int(relpages),
             "vector_dims": dims,
+            "min_col_size_bytes": min_col,
+            "max_col_size_bytes": max_col,
+            "avg_col_size_bytes": float(avg_col) if avg_col else 0.0,
             "column_size_min_bytes": min_col,
             "column_size_max_bytes": max_col,
             "column_size_avg_bytes": float(avg_col) if avg_col else 0.0,
@@ -497,6 +512,7 @@ def inspect_table_metrics(
             "toast_total_bytes": toast_tbl_b + toast_idx_b,
             "pk_index_bytes": pk_bytes,
             "hnsw_index_bytes": idx_bytes,
+            "all_indexes_bytes": pk_bytes + idx_bytes,
             "total_inclusive_bytes": total_inc_b
         }
 
@@ -708,7 +724,7 @@ def provision_scale(
                         WHERE n.nspname = %s AND c.relname = %s AND a.attname = 'embedding';
                     """, (SCHEMA_NAME, tbl_name))
                     st_code = cur.fetchone()[0]
-                    st_policy = "PLAIN" if st_code == 'p' else "EXTENDED"
+                    st_policy = ATTSTORAGE_MAP.get(st_code, "UNKNOWN")
                     if st_policy != expected_storage:
                         raise RuntimeError(f"Storage policy check failed on {tbl_name}: expected {expected_storage}, got {st_policy}")
 
@@ -772,11 +788,12 @@ def export_storage_metrics_csv(metrics_records: list[dict], output_csv_path: str
         return
     os.makedirs(os.path.dirname(output_csv_path), exist_ok=True)
     fieldnames = [
-        "schema", "table_name", "scale", "representation", "storage_policy",
+        "schema", "table_name", "scale", "representation", "status", "storage_policy",
         "row_count", "reltuples", "relpages", "vector_dims",
+        "min_col_size_bytes", "max_col_size_bytes", "avg_col_size_bytes",
         "column_size_min_bytes", "column_size_max_bytes", "column_size_avg_bytes",
         "heap_bytes", "toast_table_bytes", "toast_index_bytes", "toast_total_bytes",
-        "pk_index_bytes", "hnsw_index_bytes", "total_inclusive_bytes"
+        "pk_index_bytes", "hnsw_index_bytes", "all_indexes_bytes", "total_inclusive_bytes"
     ]
     with open(output_csv_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
