@@ -190,3 +190,9 @@ data/raw/msmarco_10k_canonical.tsv*
 
 # Experimental benchmark and pilot output artifacts
 results/
+
+# Evidence archives
+Phase2_Full_Benchmark_Evidence_*.zip
+Phase3_Analysis_Package_*.zip
+Phase3A_Tie_Sensitivity_Evidence_*.zip
+Phase3A_Evidence_Closure_Addendum_*.zip

@@ -1,7 +1,7 @@
 # Precision-Aware Query Planning for Vector Retrieval in PostgreSQL
 ## Experimental and Reproducibility Protocol
 
-**Document Version:** 1.6.0  
+**Document Version:** 2.1.0  
 **Target Venue:** IEEE International Conference on Data Engineering (ICDE) / IEEE Transactions on Knowledge and Data Engineering (TKDE)  
 **Workspace:** `CompressionAwareRag`  
 **Repository Branch:** `research/planner-sensitivity`  
@@ -31,7 +31,7 @@ To guarantee zero mutation, table locking, or cache pollution of baseline produc
 
 | Catalog / Database Name | Role | Access Policy |
 | :--- | :--- | :--- |
-| `compression_aware_rag` | Production / Review 2 baseline (180 chunks) | **STRICT READ-ONLY (DISALLOWED)** |
+| `compression_aware_rag` | Protected baseline catalog (180 chunks) | **STRICT READ-ONLY (DISALLOWED)** |
 | `postgres` | Default administrative catalog | **STRICT READ-ONLY (DISALLOWED)** |
 | `smart_document_chatbot` | Unrelated project catalog | **STRICT READ-ONLY (DISALLOWED)** |
 | `compression_aware_rag_exp` | Scaling experiment catalog ($N=1{,}001$) | **PERMITTED** (schema `planner_sensitivity`) |
@@ -157,6 +157,8 @@ flowchart LR
 
 ### Phase B: Pure Wall-Clock Latency Measurement
 - **Statement:** Parameterized `SELECT chunk_id, (embedding <=> %s::{cast}) AS distance FROM {schema}.{table} ORDER BY distance ASC LIMIT %s;`
+- **Prepared-Statement Protection:** All benchmark connections enforce `prepare_threshold=None` on the connection and `prepare=False` on cursor executions. This ensures PostgreSQL freshly plans every query under the active transaction-local cost parameters (`SET LOCAL`), completely preventing Psycopg 3 or PostgreSQL from executing stale prepared statements.
+- **Transaction Model:** Fresh transaction with `autocommit=True` wrapping queries in explicit `BEGIN READ ONLY;` and `ROLLBACK;` blocks.
 - **Distance Operator:** Uses the `pgvector` cosine distance operator `<=>` (where distance equals $1 - \cos(\theta)$), *not* Euclidean distance (`<->`).
 - **Exact Top-K Limit:** Exactly `top_k = 10` is passed as the SQL parameter, fetching strictly 10 rows.
 - **Precomputation:** Query vectors are precomputed via Ollama embedding model *prior* to starting the benchmark loop and passed as raw parameters.
@@ -196,6 +198,7 @@ flowchart LR
 ### Phase C: Diagnostic Buffer Inspection & Completeness Accounting
 - **Statement:** `EXPLAIN (ANALYZE, BUFFERS, SETTINGS, FORMAT JSON) SELECT ...;`
 - **Coverage:** Executed across all 20 evaluation queries for all 3 modes under canonical profile P4 (540 total diagnostic executions).
+- **Buffer Aggregation Model:** In PostgreSQL EXPLAIN JSON plans, parent nodes report cumulative buffer counters including their children. To determine total query buffer usage, the parser extracts the top-level root plan node counters directly (`Shared Hit Blocks`, `Shared Read Blocks`, `Shared Dirtied Blocks`, `Shared Written Blocks`), avoiding recursive child accumulation.
 - **Sequencing:** Executed strictly *after* Phase B timed SELECT queries have concluded.
 - **Runtime Completeness Accounting:** Tracks `expected`, `attempted`, `successful`, and `failed` executions.
   - Every attempt writes an explicit JSON line to `diagnostic_results.jsonl`, including errors with `error_message`.
@@ -221,7 +224,7 @@ flowchart LR
 # Verify PostgreSQL and pgvector availability
 psql -U postgres -d compression_aware_rag_scale -c "SELECT extversion FROM pg_extension WHERE extname = 'vector';"
 
-# Run full test suite (89+ tests)
+# Run full test suite (107 tests)
 pytest -v
 ```
 
@@ -244,4 +247,16 @@ python src/planner_sensitivity_experiment.py --pilot
 ```bash
 # Full execution across all scales and profiles under canonical profile P4
 python src/planner_sensitivity_experiment.py --scale all --representation all --canonical-profile P4 --passes 5 --warmup 2
+```
+
+### Step 5: Research Analysis & Provenance Verification
+```bash
+# Execute comprehensive statistical analysis & non-parametric tests
+python scripts/analysis/analyze_phase3_sensitivity.py
+
+# Execute boundary-tie tolerance sensitivity audit
+python scripts/analysis/run_phase3a_tie_sensitivity.py
+
+# Execute evidence chain closure & GUC equivalence audit
+python scripts/analysis/run_phase3a_addendum_closure.py
 ```
