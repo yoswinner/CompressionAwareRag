@@ -243,16 +243,31 @@ def assert_sensitivity_database(conn: psycopg.Connection, expected_db: str | Non
 
 def get_sensitivity_connection(target_db: str) -> psycopg.Connection:
     """
-    Opens a connection strictly enforcing read_only mode.
+    Opens a connection strictly enforcing read_only mode and disabling automatic prepared statements.
     Autocommit is enabled on the outer connection so that explicit BEGIN READ ONLY / ROLLBACK
     blocks can be managed per query.
+
+    CRITICAL PREPARED STATEMENT SAFETY:
+      prepare_threshold=None disables Psycopg 3's automatic server-side prepared statements.
+      This guarantees that every parameterized query is planned freshly under its transaction-local
+      planner GUCs (SET LOCAL random_page_cost, cpu_operator_cost, etc.) and prevents reuse of
+      stale cached generic plans across different cost profiles or execution modes.
     """
     if target_db not in ALLOWED_DATABASES:
         raise RuntimeError(
             f"REFUSING CONNECTION: Target database '{target_db}' is not in approved list {ALLOWED_DATABASES}."
         )
-    conn = psycopg.connect(get_db_connection_string(target_db), autocommit=True)
+    conn = psycopg.connect(
+        get_db_connection_string(target_db),
+        autocommit=True,
+        prepare_threshold=None
+    )
     conn.read_only = True
+    if conn.prepare_threshold is not None:
+        raise RuntimeError(
+            f"PREPARE THRESHOLD SAFETY VIOLATION: Expected prepare_threshold=None on '{target_db}', "
+            f"got {conn.prepare_threshold}!"
+        )
     assert_sensitivity_database(conn, target_db)
     register_vector(conn)
     return conn
@@ -435,6 +450,8 @@ def capture_environment_snapshot(conn: psycopg.Connection) -> dict:
         "pgvector_version": vector_version,
         "python_version": platform.python_version(),
         "psycopg_version": psycopg.__version__,
+        "prepare_threshold": getattr(conn, "prepare_threshold", None),
+        "automatic_prepared_statements_disabled": (getattr(conn, "prepare_threshold", None) is None),
         "platform": {
             "system": platform.system(),
             "release": platform.release(),
@@ -633,6 +650,83 @@ def calculate_recall_at_k(ref_results: list[dict], cand_results: list[dict], top
     return metrics["conventional_recall"]
 
 
+def retrieve_exact_ground_truth(
+    conn: psycopg.Connection,
+    query_vector: list[float],
+    schema_name: str,
+    table_name: str,
+    cast_type: str,
+    profile_params: dict,
+    top_k: int = FIXED_LIMIT
+) -> list[dict]:
+    """
+    Retrieves exact FP32 ground-truth candidate list with mandatory execution plan verification.
+
+    Guarantees:
+      1. Executes inside an isolated transaction with SET LOCAL.
+      2. Enforces exact sequential scan:
+           SET LOCAL enable_indexscan = off;
+           SET LOCAL enable_bitmapscan = off;
+           SET LOCAL enable_seqscan = on;
+           SET LOCAL max_parallel_workers_per_gather = 0;
+      3. Captures execution plan via EXPLAIN (FORMAT JSON) with prepare=False.
+      4. Explicitly asserts scan_node_type == 'Seq Scan'. Fails closed if any index scan or non-sequential scan is used.
+      5. Executes the timed-equivalent SELECT query with prepare=False.
+      6. Unconditionally concludes with ROLLBACK.
+    """
+    with conn.cursor() as cur:
+        cur.execute("BEGIN READ ONLY;")
+        try:
+            cur.execute(sql.SQL("SET LOCAL seq_page_cost = {};").format(sql.Literal(profile_params["seq_page_cost"])))
+            cur.execute(sql.SQL("SET LOCAL random_page_cost = {};").format(sql.Literal(profile_params["random_page_cost"])))
+            cur.execute(sql.SQL("SET LOCAL cpu_operator_cost = {};").format(sql.Literal(profile_params["cpu_operator_cost"])))
+            cur.execute(sql.SQL("SET LOCAL cpu_tuple_cost = {};").format(sql.Literal(profile_params["cpu_tuple_cost"])))
+            cur.execute("SET LOCAL max_parallel_workers_per_gather = 0;")
+            cur.execute("SET LOCAL enable_indexscan = off;")
+            cur.execute("SET LOCAL enable_bitmapscan = off;")
+            cur.execute("SET LOCAL enable_seqscan = on;")
+
+            # 1. Mandatory Plan Verification
+            explain_sql = sql.SQL("""
+                EXPLAIN (FORMAT JSON)
+                SELECT chunk_id, (embedding <=> %s::{cast}) AS distance
+                FROM {schema}.{table}
+                ORDER BY distance ASC
+                LIMIT %s;
+            """).format(
+                cast=sql.SQL(cast_type),
+                schema=sql.Identifier(schema_name),
+                table=sql.Identifier(table_name)
+            )
+            cur.execute(explain_sql, (query_vector, top_k), prepare=False)
+            plan_json = cur.fetchone()[0]
+            parsed_plan = parse_json_plan(plan_json)
+            actual_scan = parsed_plan.get("scan_node_type")
+            if actual_scan != "Seq Scan":
+                raise RuntimeError(
+                    f"GROUND TRUTH SCAN VERIFICATION FAILURE on '{schema_name}.{table_name}': "
+                    f"Ground-truth query must strictly execute via 'Seq Scan', but planner selected '{actual_scan}'! "
+                    f"Failing closed to prevent corrupted ground-truth baseline."
+                )
+
+            # 2. Query Execution with prepare=False
+            query_sql = sql.SQL("""
+                SELECT chunk_id, (embedding <=> %s::{cast}) AS distance
+                FROM {schema}.{table}
+                ORDER BY distance ASC
+                LIMIT %s;
+            """).format(
+                cast=sql.SQL(cast_type),
+                schema=sql.Identifier(schema_name),
+                table=sql.Identifier(table_name)
+            )
+            cur.execute(query_sql, (query_vector, top_k), prepare=False)
+            rows = cur.fetchall()
+            return [{"chunk_id": r[0], "distance": float(r[1])} for r in rows]
+        finally:
+            cur.execute("ROLLBACK;")
+
+
 def retrieve_boundary_tie_group(
     conn: psycopg.Connection,
     query_vector: list[float],
@@ -683,7 +777,7 @@ def retrieve_boundary_tie_group(
                     schema=sql.Identifier(schema_name),
                     table=sql.Identifier(table_name)
                 )
-                cur.execute(boundary_sql, (query_vector, top_k - 1))
+                cur.execute(boundary_sql, (query_vector, top_k - 1), prepare=False)
                 b_row = cur.fetchone()
                 if not b_row:
                     return {
@@ -738,7 +832,7 @@ def retrieve_boundary_tie_group(
                 schema=sql.Identifier(schema_name),
                 table=sql.Identifier(table_name)
             )
-            cur.execute(explain_sql, (query_vector, query_vector, D + tolerance))
+            cur.execute(explain_sql, (query_vector, query_vector, D + tolerance), prepare=False)
             raw_plan = cur.fetchone()[0]
             parsed_plan = parse_json_plan(raw_plan if isinstance(raw_plan, list) else json.loads(raw_plan))
             scan_type = parsed_plan.get("scan_node_type")
@@ -760,7 +854,7 @@ def retrieve_boundary_tie_group(
                 schema=sql.Identifier(schema_name),
                 table=sql.Identifier(table_name)
             )
-            cur.execute(group_sql, (query_vector, query_vector, D + max_tol))
+            cur.execute(group_sql, (query_vector, query_vector, D + max_tol), prepare=False)
             rows = cur.fetchall()
 
             items_with_distance = []
@@ -864,7 +958,7 @@ def check_boundary_distance_tie(
                 schema=sql.Identifier(schema_name),
                 table=sql.Identifier(table_name)
             )
-            cur.execute(explain_sql, (query_vector, top_k - 1))
+            cur.execute(explain_sql, (query_vector, top_k - 1), prepare=False)
             raw_plan = cur.fetchone()[0]
             parsed_plan = parse_json_plan(raw_plan if isinstance(raw_plan, list) else json.loads(raw_plan))
             scan_type = parsed_plan.get("scan_node_type")
@@ -886,7 +980,7 @@ def check_boundary_distance_tie(
                 schema=sql.Identifier(schema_name),
                 table=sql.Identifier(table_name)
             )
-            cur.execute(tie_sql, (query_vector, top_k - 1))
+            cur.execute(tie_sql, (query_vector, top_k - 1), prepare=False)
             rows = cur.fetchall()
 
             if len(rows) >= 2:
@@ -917,7 +1011,7 @@ def check_boundary_distance_tie(
                     schema=sql.Identifier(schema_name),
                     table=sql.Identifier(table_name)
                 )
-                cur.execute(group_sql, (query_vector, query_vector, r10_dist + max_tol))
+                cur.execute(group_sql, (query_vector, query_vector, r10_dist + max_tol), prepare=False)
                 group_rows = cur.fetchall()
                 items_with_distance = []
                 for r in group_rows:
@@ -1025,7 +1119,7 @@ def capture_query_plan(
                 schema=sql.Identifier(schema_name),
                 table=sql.Identifier(table_name)
             )
-            cur.execute(explain_sql, (query_vector, top_k))
+            cur.execute(explain_sql, (query_vector, top_k), prepare=False)
             raw_res = cur.fetchone()[0]
             parsed = parse_json_plan(raw_res if isinstance(raw_res, list) else json.loads(raw_res))
             plan_dict = parsed
@@ -1089,7 +1183,7 @@ def measure_query_latency(
             )
 
             t0 = time.perf_counter()
-            cur.execute(query_sql, (query_vector, top_k))  # exactly top_k (10)
+            cur.execute(query_sql, (query_vector, top_k), prepare=False)  # exactly top_k (10)
             rows = cur.fetchall()
             elapsed_ms = (time.perf_counter() - t0) * 1000.0
 
@@ -1150,7 +1244,7 @@ def execute_diagnostic_pass(
                 schema=sql.Identifier(schema_name),
                 table=sql.Identifier(table_name)
             )
-            cur.execute(explain_sql, (query_vector, top_k))
+            cur.execute(explain_sql, (query_vector, top_k), prepare=False)
             raw_res = cur.fetchone()[0]
             parsed = parse_json_plan(raw_res if isinstance(raw_res, list) else json.loads(raw_res))
             diagnostic_dict = parsed
@@ -1236,13 +1330,30 @@ def run_planner_sensitivity_benchmark(
         canonical_profile_id=active_canonical_id
     )
 
-    os.makedirs(output_dir, exist_ok=True)
     manifest_path = os.path.join(output_dir, "experiment_manifest.json")
     env_snapshot_path = os.path.join(output_dir, "environment_snapshot.json")
     plan_jsonl_path = os.path.join(output_dir, "plan_capture.jsonl")
     latency_csv_path = os.path.join(output_dir, "latency_results.csv")
     diagnostic_jsonl_path = os.path.join(output_dir, "diagnostic_results.jsonl")
     summary_csv_path = os.path.join(output_dir, "summary_results.csv")
+
+    expected_output_artifacts = [
+        manifest_path, env_snapshot_path, plan_jsonl_path,
+        latency_csv_path, diagnostic_jsonl_path, summary_csv_path
+    ]
+
+    if not dry_run:
+        existing_artifacts = [p for p in expected_output_artifacts if os.path.exists(p)]
+        if existing_artifacts:
+            raise FileExistsError(
+                f"OUTPUT DIRECTORY COLLISION: Target output directory '{output_dir}' already contains "
+                f"pre-existing benchmark artifacts:\n"
+                f"  {existing_artifacts}\n"
+                f"To prevent data contamination and ensure experimental reproducibility, every benchmark execution "
+                f"requires a fresh, empty output directory. Existing results are preserved; please specify a new "
+                f"--output-dir (e.g. results/planner_sensitivity/run_<timestamp>)."
+            )
+        os.makedirs(output_dir, exist_ok=True)
 
     print("================================================================================")
     print("PLANNER SENSITIVITY BENCHMARK EXECUTION WORKLOAD MANIFEST")
@@ -1267,8 +1378,13 @@ def run_planner_sensitivity_benchmark(
         for sc in target_scales:
             db = SCALE_DATABASE_MAP[sc]
             conn = get_sensitivity_connection(db)
+            if conn.prepare_threshold is not None:
+                raise RuntimeError(
+                    f"PREPARE THRESHOLD SAFETY VIOLATION: Dry-run scale {sc} connection on '{db}' "
+                    f"has prepare_threshold={conn.prepare_threshold}; must be None!"
+                )
             conn.close()
-        print("[DRY RUN] All target databases accessible and verified read-only.")
+        print("[DRY RUN] All target databases accessible and verified read-only with prepare_threshold=None.")
         return {
             "status": "dry_run_success",
             "scales": target_scales,
@@ -1295,18 +1411,17 @@ def run_planner_sensitivity_benchmark(
         json.dump(env_snapshot, f, indent=2)
     print(f"[RECORDED] Host environment snapshot written to {env_snapshot_path}")
 
-    # Initialize CSV writers
-    latency_file = open(latency_csv_path, "a", newline="", encoding="utf-8")
+    # Initialize CSV writers in fresh write mode
+    latency_file = open(latency_csv_path, "w", newline="", encoding="utf-8")
     latency_writer = csv.writer(latency_file)
-    if os.path.getsize(latency_csv_path) == 0:
-        latency_writer.writerow([
-            "timestamp", "scale", "representation", "profile_id", "mode",
-            "pass_id", "query_id", "latency_ms", "recall_at_10", "tie_aware_recall_at_10",
-            "has_distance_tie", "boundary_distance", "boundary_delta"
-        ])
+    latency_writer.writerow([
+        "timestamp", "scale", "representation", "profile_id", "mode",
+        "pass_id", "query_id", "latency_ms", "recall_at_10", "tie_aware_recall_at_10",
+        "has_distance_tie", "boundary_distance", "boundary_delta"
+    ])
 
-    plan_jsonl_file = open(plan_jsonl_path, "a", encoding="utf-8")
-    diagnostic_jsonl_file = open(diagnostic_jsonl_path, "a", encoding="utf-8")
+    plan_jsonl_file = open(plan_jsonl_path, "w", encoding="utf-8")
+    diagnostic_jsonl_file = open(diagnostic_jsonl_path, "w", encoding="utf-8")
 
     all_trial_records = []
     summary_records = []
@@ -1339,13 +1454,18 @@ def run_planner_sensitivity_benchmark(
     for scale in target_scales:
         target_db = SCALE_DATABASE_MAP[scale]
         conn = get_sensitivity_connection(target_db)
+        if conn.prepare_threshold is not None:
+            raise RuntimeError(
+                f"PREPARE THRESHOLD SAFETY VIOLATION: Benchmark connection for scale {scale} on '{target_db}' "
+                f"has prepare_threshold={conn.prepare_threshold}; must strictly be None!"
+            )
         print(f"\n=======================================================")
         print(f"PROCESSING SCALE: {scale} (Database: '{target_db}')")
         print(f"=======================================================")
 
         try:
             # 3. Compute scale-specific FP32 Exact Ground Truth and Boundary Ties for Recall@10
-            # Ground truth is obtained from fp32_extended in exact mode using canonical profile
+            # Ground truth is obtained from fp32_extended in exact mode with Seq Scan plan verification
             fp32_ext_tbl = f"chunks_{scale}_fp32_extended"
             ground_truths = {}
             ground_truth_ties = {}
@@ -1353,9 +1473,9 @@ def run_planner_sensitivity_benchmark(
 
             print(f"Computing FP32 Exact Ground Truth for scale {scale} (Canonical Profile: {active_canonical_id}, Top-K: {top_k})...")
             for q_idx, q_vec in enumerate(embeddings):
-                gt_rows, _ = measure_query_latency(
+                gt_rows = retrieve_exact_ground_truth(
                     conn, q_vec, SCHEMA_NAME, fp32_ext_tbl, "vector(768)",
-                    canonical_prof_params, mode="exact", top_k=top_k
+                    canonical_prof_params, top_k=top_k
                 )
                 ground_truths[q_idx] = gt_rows[:top_k]
 
@@ -1554,13 +1674,27 @@ def run_planner_sensitivity_benchmark(
                         )
 
                         if diag_info.get("status") == "success":
-                            diagnostic_accounting["successful"] += 1
-                            if mode == "forced_hnsw":
-                                if diag_info.get("scan_node_type") != "Index Scan" or diag_info.get("index_name") != expected_index_name:
-                                    raise RuntimeError(
-                                        f"DIAGNOSTIC INDEX VERIFICATION FAILURE on '{table_name}': Expected Index Scan "
-                                        f"using '{expected_index_name}', got '{diag_info.get('index_name')}'."
-                                    )
+                            if mode == "forced_hnsw" and (
+                                diag_info.get("scan_node_type") != "Index Scan" or
+                                diag_info.get("index_name") != expected_index_name
+                            ):
+                                diagnostic_accounting["failed"] += 1
+                                diag_err = (
+                                    f"DIAGNOSTIC INDEX VERIFICATION FAILURE on '{table_name}': Expected Index Scan "
+                                    f"using '{expected_index_name}', got '{diag_info.get('index_name')}'."
+                                )
+                                diagnostic_accounting["errors"].append({
+                                    "scale": scale,
+                                    "rep": rep,
+                                    "profile_id": active_canonical_id,
+                                    "mode": mode,
+                                    "diagnostic_query_id": q_idx,
+                                    "error": diag_err
+                                })
+                                diag_info["status"] = "error"
+                                diag_info["error_message"] = diag_err
+                            else:
+                                diagnostic_accounting["successful"] += 1
                         else:
                             diagnostic_accounting["failed"] += 1
                             diagnostic_accounting["errors"].append({
@@ -1718,7 +1852,19 @@ def run_planner_sensitivity_benchmark(
             f"Failing closed to prevent corrupted experimental reporting."
         )
 
-    print(f"\n[WORKLOAD VERIFIED] Actual timed executions ({actual_timed_executions}) and diagnostics ({actual_diagnostic_executions}) match declared manifest exactly.")
+    execution_count_status = "PASSED"
+    latency_dataset_status = "COMPLETE" if latency_accounting["dataset_status"] == "complete" else "INCOMPLETE"
+    diagnostic_dataset_status = "COMPLETE" if diagnostic_accounting["dataset_status"] == "complete" else "INCOMPLETE"
+    overall_status = (
+        "COMPLETE" if (latency_dataset_status == "COMPLETE" and diagnostic_dataset_status == "COMPLETE")
+        else "PARTIAL" if latency_dataset_status == "COMPLETE"
+        else "INCOMPLETE"
+    )
+
+    print(f"\n[WORKLOAD VERIFIED] Execution count validation: {execution_count_status} (Timed: {actual_timed_executions}, Diagnostics: {actual_diagnostic_executions})")
+    print(f"[STATUS] Latency Dataset Completeness: {latency_dataset_status} ({latency_accounting['successful']}/{latency_accounting['expected']} successful, {latency_accounting['failed']} failed)")
+    print(f"[STATUS] Diagnostic Dataset Completeness: {diagnostic_dataset_status} ({diagnostic_accounting['successful']}/{diagnostic_accounting['expected']} successful, {diagnostic_accounting['failed']} failed)")
+    print(f"[STATUS] Overall Experiment Status: {overall_status}")
 
     # Write summary CSV
     if summary_records:
@@ -1738,6 +1884,17 @@ def run_planner_sensitivity_benchmark(
         "timestamp_completed": time_completed_iso,
         "random_seed": random_seed,
         "git_commit": env_snapshot["git_commit"],
+        "output_directory": os.path.abspath(output_dir),
+        "status_summary": {
+            "execution_count_validation_status": execution_count_status,
+            "latency_dataset_completeness_status": latency_dataset_status,
+            "diagnostic_dataset_completeness_status": diagnostic_dataset_status,
+            "overall_experiment_status": overall_status
+        },
+        "execution_count_validation_status": execution_count_status,
+        "latency_dataset_completeness_status": latency_dataset_status,
+        "diagnostic_dataset_completeness_status": diagnostic_dataset_status,
+        "overall_experiment_status": overall_status,
         "scales_evaluated": target_scales,
         "representations_evaluated": target_reps,
         "profiles_evaluated": list(target_profiles.keys()),
@@ -1758,7 +1915,7 @@ def run_planner_sensitivity_benchmark(
         },
         "latency_accounting": latency_accounting,
         "diagnostic_accounting": diagnostic_accounting,
-        "workload_validation": "PASSED",
+        "workload_validation": execution_count_status,
         "total_timing_trials": len(all_trial_records),
         "total_summary_configurations": len(summary_records),
         "sample_execution_sequence": actual_execution_order_log[:20],
@@ -1775,7 +1932,11 @@ def run_planner_sensitivity_benchmark(
     print(f"[EXPORTED] Experiment manifest written to {manifest_path}")
 
     return {
-        "status": "completed",
+        "status": overall_status.lower(),
+        "execution_count_status": execution_count_status,
+        "latency_dataset_status": latency_dataset_status,
+        "diagnostic_dataset_status": diagnostic_dataset_status,
+        "overall_status": overall_status,
         "manifest": manifest_data,
         "summary": summary_records
     }

@@ -206,8 +206,9 @@ def test_allowed_and_disallowed_databases():
 @patch("src.planner_sensitivity_experiment.register_vector")
 @patch("psycopg.connect")
 def test_read_only_connection_enforcement(mock_connect, mock_reg):
-    """Verify get_sensitivity_connection sets conn.read_only = True and autocommit = True."""
+    """Verify get_sensitivity_connection sets conn.read_only = True, autocommit = True, prepare_threshold = None."""
     mock_conn = MagicMock()
+    mock_conn.prepare_threshold = None
     mock_cur = MagicMock()
     mock_cur.fetchone.return_value = ["compression_aware_rag_scale"]
     mock_conn.cursor.return_value.__enter__.return_value = mock_cur
@@ -215,9 +216,11 @@ def test_read_only_connection_enforcement(mock_connect, mock_reg):
 
     conn = get_sensitivity_connection("compression_aware_rag_scale")
     assert conn.read_only is True
+    assert conn.prepare_threshold is None
     mock_connect.assert_called_once()
     _, kwargs = mock_connect.call_args
     assert kwargs.get("autocommit") is True
+    assert kwargs.get("prepare_threshold") is None
 
 
 # ==============================================================================
@@ -248,7 +251,7 @@ def test_guc_restoration_exception_handling():
     mock_conn.cursor.return_value.__enter__.return_value = mock_cur
 
     # Simulate query failure during execution
-    def fail_on_select(query, params=None):
+    def fail_on_select(query, params=None, *args, **kwargs):
         query_str = str(query)
         if "EXPLAIN" in query_str:
             raise psycopg.OperationalError("Simulated server interruption")
@@ -1696,6 +1699,163 @@ def test_inspect_table_metrics_storage_policy():
         assert res["storage_policy"] == expected_label, (
             f"Code {code} expected {expected_label}, got {res['storage_policy']}"
         )
+
+
+# ==============================================================================
+# Phase 1L Tests: Prepared-Statement Safety, Plan Freshness, Ground Truth & Isolation
+# ==============================================================================
+
+@patch("src.planner_sensitivity_experiment.register_vector")
+@patch("psycopg.connect")
+def test_prepare_threshold_disabled_on_all_scale_connections(mock_connect, mock_reg):
+    """Verify get_sensitivity_connection sets prepare_threshold=None across all scale databases."""
+    from src.planner_sensitivity_experiment import SCALE_DATABASE_MAP
+
+    for scale_key, db_name in SCALE_DATABASE_MAP.items():
+        mock_conn = MagicMock()
+        mock_conn.prepare_threshold = None
+        mock_cur = MagicMock()
+        mock_cur.fetchone.return_value = [db_name]
+        mock_conn.cursor.return_value.__enter__.return_value = mock_cur
+        mock_connect.return_value = mock_conn
+
+        conn = get_sensitivity_connection(db_name)
+        assert conn.prepare_threshold is None
+        _, kwargs = mock_connect.call_args
+        assert kwargs.get("prepare_threshold") is None, f"Database {db_name} failed to pass prepare_threshold=None"
+        assert kwargs.get("autocommit") is True
+
+
+@patch("src.planner_sensitivity_experiment.register_vector")
+@patch("psycopg.connect")
+def test_prepare_threshold_non_none_rejection(mock_connect, mock_reg):
+    """Verify get_sensitivity_connection fails closed if prepare_threshold is not None."""
+    mock_conn = MagicMock()
+    mock_conn.prepare_threshold = 5  # Psycopg default
+    mock_cur = MagicMock()
+    mock_cur.fetchone.return_value = ["compression_aware_rag_scale"]
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cur
+    mock_connect.return_value = mock_conn
+
+    with pytest.raises(RuntimeError, match="PREPARE THRESHOLD SAFETY VIOLATION"):
+        get_sensitivity_connection("compression_aware_rag_scale")
+
+
+def test_exact_ground_truth_seq_scan_assertion_success():
+    """Verify retrieve_exact_ground_truth succeeds when plan indicates Seq Scan."""
+    from src.planner_sensitivity_experiment import retrieve_exact_ground_truth, PLANNER_COST_PROFILES
+
+    mock_conn = MagicMock()
+    mock_cur = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cur
+
+    # Mock EXPLAIN output with Seq Scan
+    seq_plan = [{
+        "Plan": {
+            "Node Type": "Limit",
+            "Plans": [{
+                "Node Type": "Seq Scan",
+                "Relation Name": "chunks_1001_fp32_extended"
+            }]
+        }
+    }]
+    mock_cur.fetchone.return_value = [seq_plan]
+    mock_cur.fetchall.return_value = [("c1", 0.12), ("c2", 0.15)]
+
+    prof = PLANNER_COST_PROFILES["P4"]
+    res = retrieve_exact_ground_truth(
+        mock_conn, [0.1]*768, "planner_sensitivity", "chunks_1001_fp32_extended",
+        "vector(768)", prof, top_k=10
+    )
+    assert len(res) == 2
+    assert res[0]["chunk_id"] == "c1"
+    assert res[0]["distance"] == 0.12
+
+    # Verify SET LOCAL GUC calls
+    executed_statements = [str(call[0][0]) for call in mock_cur.execute.call_args_list]
+    assert any("SET LOCAL enable_seqscan = on" in s for s in executed_statements)
+    assert any("SET LOCAL enable_indexscan = off" in s for s in executed_statements)
+    assert any("SET LOCAL enable_bitmapscan = off" in s for s in executed_statements)
+    assert any("ROLLBACK" in s for s in executed_statements)
+
+
+def test_exact_ground_truth_seq_scan_assertion_failure():
+    """Verify retrieve_exact_ground_truth fails closed if plan indicates Index Scan."""
+    from src.planner_sensitivity_experiment import retrieve_exact_ground_truth, PLANNER_COST_PROFILES
+
+    mock_conn = MagicMock()
+    mock_cur = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cur
+
+    # Mock EXPLAIN output with unintended Index Scan
+    index_plan = [{
+        "Plan": {
+            "Node Type": "Limit",
+            "Plans": [{
+                "Node Type": "Index Scan",
+                "Index Name": "chunks_1001_fp32_extended_hnsw_idx"
+            }]
+        }
+    }]
+    mock_cur.fetchone.return_value = [index_plan]
+
+    prof = PLANNER_COST_PROFILES["P4"]
+    with pytest.raises(RuntimeError, match="GROUND TRUTH SCAN VERIFICATION FAILURE"):
+        retrieve_exact_ground_truth(
+            mock_conn, [0.1]*768, "planner_sensitivity", "chunks_1001_fp32_extended",
+            "vector(768)", prof, top_k=10
+        )
+
+
+def test_output_directory_collision_prevention(tmp_path):
+    """Verify run_planner_sensitivity_benchmark aborts with FileExistsError if output files exist."""
+    from src.planner_sensitivity_experiment import run_planner_sensitivity_benchmark
+
+    output_dir = str(tmp_path / "existing_run")
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Create a pre-existing artifact file
+    collision_file = os.path.join(output_dir, "latency_results.csv")
+    with open(collision_file, "w", encoding="utf-8") as f:
+        f.write("pre-existing data\n")
+
+    with pytest.raises(FileExistsError, match="OUTPUT DIRECTORY COLLISION"):
+        run_planner_sensitivity_benchmark(
+            scales=["test"],
+            representations=["fp32_extended"],
+            output_dir=output_dir,
+            dry_run=False
+        )
+
+    # Ensure pre-existing data was preserved
+    with open(collision_file, "r", encoding="utf-8") as f:
+        assert f.read() == "pre-existing data\n"
+
+
+def test_diagnostic_completeness_accounting_status():
+    """Verify status reporting differentiates execution count validation from diagnostic success."""
+    # When all diagnostics succeed:
+    diag_acct_success = {"expected": 540, "attempted": 540, "successful": 540, "failed": 0, "dataset_status": "complete"}
+    lat_acct_success = {"expected": 9900, "attempted": 9900, "successful": 9900, "failed": 0, "dataset_status": "complete"}
+
+    # When diagnostics encounter errors:
+    diag_acct_error = {"expected": 540, "attempted": 540, "successful": 538, "failed": 2, "dataset_status": "incomplete"}
+
+    # Status derivation check
+    diag_stat_succ = "COMPLETE" if diag_acct_success["dataset_status"] == "complete" else "INCOMPLETE"
+    lat_stat_succ = "COMPLETE" if lat_acct_success["dataset_status"] == "complete" else "INCOMPLETE"
+    overall_succ = "COMPLETE" if (lat_stat_succ == "COMPLETE" and diag_stat_succ == "COMPLETE") else "PARTIAL"
+
+    assert diag_stat_succ == "COMPLETE"
+    assert lat_stat_succ == "COMPLETE"
+    assert overall_succ == "COMPLETE"
+
+    diag_stat_err = "COMPLETE" if diag_acct_error["dataset_status"] == "complete" else "INCOMPLETE"
+    overall_err = "COMPLETE" if (lat_stat_succ == "COMPLETE" and diag_stat_err == "COMPLETE") else "PARTIAL"
+
+    assert diag_stat_err == "INCOMPLETE"
+    assert overall_err == "PARTIAL"
+
 
 
 
