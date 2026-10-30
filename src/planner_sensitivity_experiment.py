@@ -298,13 +298,16 @@ def parse_json_plan(plan_json_obj: list | dict) -> dict:
     scan_node = None
     sort_node = None
 
-    shared_hit = 0
-    shared_read = 0
-    shared_dirtied = 0
-    shared_written = 0
+    # For query-level total buffers, extract counters from the root Plan node only.
+    # PostgreSQL reports cumulative buffer usage at parent nodes as well as their children;
+    # summing across descendants causes double/triple counting across parent Limit/Sort/Scan nodes.
+    shared_hit = root_node.get("Shared Hit Blocks", 0)
+    shared_read = root_node.get("Shared Read Blocks", 0)
+    shared_dirtied = root_node.get("Shared Dirtied Blocks", 0)
+    shared_written = root_node.get("Shared Written Blocks", 0)
 
     def traverse(node):
-        nonlocal scan_node, sort_node, shared_hit, shared_read, shared_dirtied, shared_written
+        nonlocal scan_node, sort_node
         if not isinstance(node, dict):
             return
 
@@ -314,11 +317,6 @@ def parse_json_plan(plan_json_obj: list | dict) -> dict:
         elif any(s in node_type for s in ["Scan", "Index", "Bitmap"]):
             if scan_node is None:
                 scan_node = node
-
-        shared_hit += node.get("Shared Hit Blocks", 0)
-        shared_read += node.get("Shared Read Blocks", 0)
-        shared_dirtied += node.get("Shared Dirtied Blocks", 0)
-        shared_written += node.get("Shared Written Blocks", 0)
 
         for child in node.get("Plans", []):
             traverse(child)

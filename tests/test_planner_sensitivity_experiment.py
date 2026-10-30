@@ -378,6 +378,90 @@ def test_nested_plan_tree_parsing():
     assert parsed["relation_name"] == "chunks_10000_fp16_extended"
 
 
+def test_parse_json_plan_root_buffer_aggregation_regression():
+    """
+    Regression test for root buffer aggregation in nested execution plans.
+    PostgreSQL reports cumulative buffer counters at parent nodes.
+    Query-level totals must be extracted strictly from the root Plan node,
+    and NOT recursively summed across child nodes (Limit -> Sort -> Seq Scan).
+    """
+    # Case 1: Limit -> Sort -> Seq Scan (multi-level hierarchy with cumulative buffers)
+    nested_seq_plan = [{
+        "Plan": {
+            "Node Type": "Limit",
+            "Startup Cost": 41.14,
+            "Total Cost": 41.17,
+            "Shared Hit Blocks": 100,
+            "Shared Read Blocks": 50,
+            "Shared Dirtied Blocks": 10,
+            "Shared Written Blocks": 5,
+            "Plans": [{
+                "Node Type": "Sort",
+                "Startup Cost": 41.14,
+                "Total Cost": 43.65,
+                "Shared Hit Blocks": 100,
+                "Shared Read Blocks": 50,
+                "Shared Dirtied Blocks": 10,
+                "Shared Written Blocks": 5,
+                "Plans": [{
+                    "Node Type": "Seq Scan",
+                    "Relation Name": "chunks_1001_fp32_extended",
+                    "Startup Cost": 0.0,
+                    "Total Cost": 19.51,
+                    "Shared Hit Blocks": 100,
+                    "Shared Read Blocks": 50,
+                    "Shared Dirtied Blocks": 10,
+                    "Shared Written Blocks": 5
+                }]
+            }]
+        }
+    }]
+
+    parsed_seq = parse_json_plan(nested_seq_plan)
+    assert parsed_seq["root_node_type"] == "Limit"
+    assert parsed_seq["scan_node_type"] == "Seq Scan"
+    assert parsed_seq["has_sort_node"] is True
+    # Crucial assertion: exactly 100 hits, 50 reads, 10 dirtied, 5 written (NOT 300, 150, 30, 15)
+    assert parsed_seq["shared_hit_buffers"] == 100
+    assert parsed_seq["shared_read_buffers"] == 50
+    assert parsed_seq["shared_dirtied_buffers"] == 10
+    assert parsed_seq["shared_written_buffers"] == 5
+
+    # Case 2: Limit -> Index Scan (two-level hierarchy)
+    nested_idx_plan = [{
+        "Plan": {
+            "Node Type": "Limit",
+            "Startup Cost": 10.05,
+            "Total Cost": 15.20,
+            "Shared Hit Blocks": 42,
+            "Shared Read Blocks": 8,
+            "Shared Dirtied Blocks": 2,
+            "Shared Written Blocks": 1,
+            "Plans": [{
+                "Node Type": "Index Scan",
+                "Index Name": "chunks_1001_fp32_extended_hnsw_idx",
+                "Relation Name": "chunks_1001_fp32_extended",
+                "Startup Cost": 10.05,
+                "Total Cost": 15.20,
+                "Shared Hit Blocks": 42,
+                "Shared Read Blocks": 8,
+                "Shared Dirtied Blocks": 2,
+                "Shared Written Blocks": 1
+            }]
+        }
+    }]
+
+    parsed_idx = parse_json_plan(nested_idx_plan)
+    assert parsed_idx["root_node_type"] == "Limit"
+    assert parsed_idx["scan_node_type"] == "Index Scan"
+    assert parsed_idx["index_name"] == "chunks_1001_fp32_extended_hnsw_idx"
+    assert parsed_idx["has_sort_node"] is False
+    assert parsed_idx["shared_hit_buffers"] == 42
+    assert parsed_idx["shared_read_buffers"] == 8
+    assert parsed_idx["shared_dirtied_buffers"] == 2
+    assert parsed_idx["shared_written_buffers"] == 1
+
+
 def test_root_vs_scan_node_cost_extraction():
     """Verify distinct extraction of root costs vs scan-node costs."""
     plan_raw = [{
