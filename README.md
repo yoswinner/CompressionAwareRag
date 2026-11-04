@@ -1,16 +1,30 @@
-# Precision-Aware Query Planning for Vector Retrieval in PostgreSQL
+# How FP16 Vector Representation and TOAST Storage Layouts Shift Query Plan Selection in PostgreSQL: An Empirical and Cost-Model Study
 
-[![Python](https://img.shields.io/badge/Python-3.11%2B-blue.svg)](https://www.python.org/)
+[![Python](https://img.shields.io/badge/Python-3.13-blue.svg)](https://www.python.org/)
 [![Database](https://img.shields.io/badge/PostgreSQL-18.4-336791.svg)](https://www.postgresql.org/)
 [![Extension](https://img.shields.io/badge/pgvector-0.8.4-green.svg)](https://github.com/pgvector/pgvector)
-[![Embedding](https://img.shields.io/badge/Ollama-nomic--embed--text-orange.svg)](https://ollama.com/)
-[![Tests](https://img.shields.io/badge/Tests-120%20passed-brightgreen.svg)](tests/)
+[![Tests](https://img.shields.io/badge/Tests-77%20passed%20(offline)-brightgreen.svg)](tests/)
+[![Manuscript](https://img.shields.io/badge/Manuscript-Final%20Submission-blueviolet.svg)](./Precision_Aware_Vector_Retrieval_Final.pdf)
 
-An independent experimental research project investigating how **coordinate-level numerical quantization** (`halfvec` / IEEE 754 Float16) and **physical storage layout** (`STORAGE EXTENDED` vs. `STORAGE PLAIN`) alter PostgreSQL query planner cost estimates, access-path selection (HNSW index scan vs. sequential scan), execution latency, shared buffer access dynamics, and nearest-neighbor Recall@10 across varying corpus sizes and planner-cost configurations.
+An independent experimental and cost-model research study investigating how **coordinate-level numerical quantization** (`halfvec` / IEEE 754 Float16) and **physical storage layout** (`STORAGE EXTENDED` vs. `STORAGE PLAIN`) alter PostgreSQL query planner cost estimates, access-path selection (HNSW index scan vs. sequential scan), execution latency, shared buffer access dynamics, and nearest-neighbor Recall@10 across 18 corpus scales ($N \in [500, 5000]$) and 9 planner-cost configurations (`P1`–`P9`).
+
+---
+
+## Final Submission Documents
+
+The final research paper manuscript associated with this study is available directly at the root of this repository:
+- **PDF Document:** [Precision_Aware_Vector_Retrieval_Final.pdf](./Precision_Aware_Vector_Retrieval_Final.pdf)
+- **Word Document (Editable):** [Precision_Aware_Vector_Retrieval_Final.docx](./Precision_Aware_Vector_Retrieval_Final.docx)
+- **Canonical Markdown Source:** [Precision_Aware_Vector_Retrieval_Source.md](./Precision_Aware_Vector_Retrieval_Source.md)
+
+### Repository Architecture & Reproduction Materials
+- **CompressionAwareRag (This Repository - Public):** Hosts the original research-development history, exploratory prototype pipelines, core execution code, and offline test harnesses.
+- **pgvector-planner-sensitivity (Curated Reproduction Snapshot - Private):** A dedicated standalone reproduction repository containing the 45-file operational research core (8 execution scripts, 6 library modules, 3 offline test files, and 28 captured benchmark evidence files across the 3-scale evaluation, 18-scale sweep, and 486-cell cost validation). Access for academic review may be requested from the author.
 
 ---
 
 ## Table of Contents
+- [Final Submission Documents](#final-submission-documents)
 1. [Research Overview](#1-research-overview)
 2. [Problem Statement and Motivation](#2-problem-statement-and-motivation)
 3. [Research Questions](#3-research-questions)
@@ -305,37 +319,58 @@ python scripts/verify_table_readiness.py --scale all
 
 ## 16. Benchmark Reproduction Commands
 
-Execute the full 9,900-query benchmark:
+This repository implements a three-level scientific reproducibility framework:
+
+### Level 1: Offline Analysis, Statistical Tests, and Figure Generation (Zero Database Required)
 ```bash
+# 1. Run core offline research test suite (77 tests, ~4.4s)
+pytest
+
+# 2. Reproduce publication figures (Figs 1, 2, 3) at 300 DPI
+python scripts/generate_paper_figures.py
+
+# 3. Run independent non-parametric statistical analysis (Friedman omnibus, Wilcoxon signed-rank, bootstrap CIs)
+python scripts/analysis/analyze_phase3_sensitivity.py
+
+# 4. Verify the 486-cell candidate-cost validation matrix against captured evidence
+python scripts/run_phase4f1_exact_validation.py --verify-only
+```
+
+### Level 2: Database Experiment Execution (Local PostgreSQL 18.4 + pgvector 0.8.4)
+```bash
+# 1. Preflight table readiness across scales
+python scripts/verify_table_readiness.py --scale 1001
+python scripts/verify_table_readiness.py --scale 5000
+python scripts/verify_table_readiness.py --scale 10000
+
+# 2. Execute live 486-cell read-only exact candidate-cost validation
+python scripts/run_phase4f1_exact_validation.py
+
+# 3. Finalize and validate the 18-scale plan sweep
+python scripts/run_phase4e3_scale_sweep.py --finalize-existing
+
+# 4. Execute the primary benchmark runner (if re-executing full trial passes)
 python src/planner_sensitivity_experiment.py --scale all --representation all --canonical-profile P4 --warmup-passes 2 --measured-passes 5 --random-seed 42 --output-dir results/planner_sensitivity/full_run_<id>
 ```
 
-Run independent statistical analysis (offline):
-```bash
-python scripts/analysis/analyze_phase3_sensitivity.py
-```
-
-Run boundary-tie sensitivity analysis (read-only DB):
-```bash
-python scripts/analysis/run_phase3a_tie_sensitivity.py
-```
-
-Run evidence closure audit (read-only DB):
-```bash
-python scripts/analysis/run_phase3a_addendum_closure.py
-```
+### Level 3: Upstream Dataset Reconstruction & Scope Boundaries
+- Pre-bundled in repository: 10,001-chunk metadata (`msmarco_10k_canonical.meta.json`), queries $q_0$–$q_{19}$ (`src/representations.py`), and query vectors (`recovered_query_vectors.csv`).
+- Methodological limitations: Recomputing 10,001 embeddings from raw BeIR/msmarco requires an external GPU/Ollama instance (`nomic-embed-text:latest`) and optional dependencies (`pip install -r requirements-optional.txt`). The upstream raw document selector is not bundled in this repository (Manuscript V1.3.2, Sec. VI-B Limitation 7).
 
 ---
 
 ## 17. Test Execution
 
-Run the complete 120-test test suite:
-```bash
-pytest -v
-```
-All 120 tests pass in approximately 28 seconds.
+The test suite is organized to support fast, offline test execution without external service dependencies:
 
----
+```bash
+# Run core research test suite (77 tests, 100% offline, ~4.4s)
+pytest
+
+# Run the full 120-test suite across all modules (including legacy and integration tests)
+pytest tests/
+```
+When running the full suite with external services offline, tests requiring a live Ollama daemon are cleanly skipped (`104 passed, 16 skipped in ~7s, 0 failed`).
 
 ## 18. Documentation Index
 
